@@ -7,6 +7,7 @@ token.json
 
 # Real data (Merrill exports)
 *.csv
+!tests/sample_data/*.csv
 
 # OS / Python noise
 .DS_Store
