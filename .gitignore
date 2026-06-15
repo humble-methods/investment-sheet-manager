@@ -1,0 +1,17 @@
+# Secrets / local-only — never commit
+.secrets.local.md
+credentials.json
+token.json
+.env
+*.local
+
+# Real data (Merrill exports)
+*.csv
+
+# OS / Python noise
+.DS_Store
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
