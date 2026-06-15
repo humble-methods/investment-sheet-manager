@@ -335,13 +335,17 @@ def parse_unrealized_csv(filepath: str | Path) -> list[Transaction]:
 def parse_holdings_csv(filepath: str | Path) -> tuple[
     dict[tuple[str, str], float],   # equity: {(account, symbol): quantity}
     dict[str, float],               # cash:   {account: sweep/mmkt $ balance}
+    dict[str, str],                 # registrations: {account: account_registration}
 ]:
     """
     Equity map → verification of computed holdings (skips cash rows).
     Cash map → bootstrap + reconciliation source for cash balances. The cash
       sweep (990156937) and IIAXX appear ONLY here, not in Unrealized, so the
       Holdings CSV is the authoritative cash source. Value/Quantity is dollars.
-    Also returns the COB date (caller uses it as the cash as_of_date).
+    Registrations map → authoritative per-account registration for EVERY account
+      (equity + cash). A Roth held only as IIAXX cash has no equity/INIT_BUY
+      transaction, so a transaction-derived registration map would miss it and
+      mis-label it as a CMA sweep account during cash reconciliation.
     """
 ```
 
