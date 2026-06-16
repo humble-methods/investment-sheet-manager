@@ -1,5 +1,17 @@
 # Investment Sheet Manager — Claude Memory Bank
 
+## Development Workflow
+
+**After every code change, run `/update-claude-md` before committing.** Do not wait to be asked — invoke it proactively. It will:
+1. Verify tests shipped with the change (refuse to proceed if they didn't)
+2. Classify the change as a bug fix or new feature
+3. Propose a targeted addition to this file
+4. Write it after confirmation
+
+**Tests must ship with every change.** Bug fixes especially require a test that would have caught the regression. A fix with no test will be caught again.
+
+---
+
 ## Project Goal
 
 Build a lightweight family portfolio management workflow using Merrill Edge CSV exports as source of truth. Hank and his mom drop downloaded CSVs into a shared Google Drive folder, then open a Google Colab notebook to manually trigger processing. The notebook pulls the latest engine code from GitHub, processes all pending CSVs, and writes outputs to Google Sheets.
