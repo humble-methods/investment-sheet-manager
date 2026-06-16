@@ -37,6 +37,7 @@ investment-sheet-manager/
 ├── README.md
 ├── requirements.txt
 ├── .gitignore
+├── pyproject.toml                   # Package config for `pip install git+...` in Colab
 ├── portfolio/
 │   ├── __init__.py
 │   ├── config.py                    # Symbol overrides, Drive IDs, Sheet ID, constants
@@ -438,6 +439,8 @@ Google Sheets GOOGLEFINANCE formulas live in additional columns (not written by 
 19. **Sweep Deposit/Withdrawal are netted trade settlement**: The cash-sweep rows already net buys/sells/dividends as they settle (6/3 trades net ≈ +$41,414 → $41,412 sweep deposit on 6/5). Summing both trade amounts AND sweep rows double-counts — pick one model and validate against a real multi-month set. External contributions are indistinguishable from internal sweeps.
 
 20. **New/un-bootstrapped accounts**: An account can appear in an activity statement with no prior bootstrap. Skip + flag it until BOTH an Unrealized (equity lots + init date) and a Holdings (cash init) intake bootstrap it; never crash, never partially process.
+
+21. **CSV type detection is filename-first, then header-sniffing**: `detect_csv_type()` matches known Merrill prefixes (`PendingAndSettledActivity`/`Settled`→activity, `Holdings`, `Realized`, `Unrealized`); if the name doesn't match AND a filepath is given, it sniffs the header row (utf-8-sig). Fallback order is load-bearing: `Trade Date`→activity, `Unit Cost ($)`→unrealized, `Liquidation Date`→realized, `Price ($)`→holdings — `Price ($)` is checked LAST because activity rows also have it. Filename always wins over content. Without the fallback, user-renamed files (e.g. `activity_1.csv`) classify as `unknown` and are silently skipped → 0 rows processed on first run. Always pass the local path: `detect_csv_type(name, path)`.
 
 ---
 
