@@ -17,16 +17,21 @@ from portfolio.sheets.writer import (
     _read_tab_rows,
     load_existing_transaction_keys,
     load_existing_source_files,
+    load_recorded_symbols,
+    load_watchlist_symbols,
     write_transactions,
     write_holdings,
     write_cash,
     write_stock_metrics,
+    write_price_history,
     write_run_log,
     TAB_TRANSACTIONS,
     TAB_HOLDINGS,
     TAB_CASH,
     TAB_STOCK_METRICS,
     TAB_RUN_LOG,
+    TAB_WATCHLIST,
+    TAB_PRICE_HISTORY,
     TRANSACTIONS_HEADERS,
     HOLDINGS_HEADERS,
     CASH_HEADERS,
@@ -348,6 +353,82 @@ def test_load_existing_source_files():
     assert "activity.csv" in files
 
 
+def test_dedup_readback_is_position_based():
+    """Relabeling the Transactions header must NOT change dedup keys.
+
+    Read-back is keyed by column POSITION (TRANSACTIONS_KEYS), not header text, so
+    an already-deployed sheet with the OLD snake_case header and a freshly-written
+    sheet with the NEW Title Case header produce identical dedup keys. Without this,
+    renaming headers would fail every match and mass-reimport duplicate rows.
+    """
+    expected = _tx_canonical_key(_make_tx(source_file="act.csv"))
+    data_row = [
+        "2026-01-15", "2026-01-17", "Settled", "11A-00003", "CMA-Edge",
+        "BUY", "Apple", "AAPL", "10.0", "150.0", "-1500.0", "act.csv",
+    ]
+    old_snake_case_header = [
+        "trade_date", "settlement_date", "status", "account_number",
+        "account_registration", "tx_type", "description", "symbol",
+        "quantity", "price", "amount", "source_file",
+    ]
+    for header in (old_snake_case_header, TRANSACTIONS_HEADERS):
+        ws = _tab_mock(TAB_TRANSACTIONS, [header, data_row])
+        sh = _sh_with_tabs(ws)
+        assert load_existing_transaction_keys(sh) == {expected}
+
+
+# ---------------------------------------------------------------------------
+# load_recorded_symbols / load_watchlist_symbols (metric symbol sourcing)
+# ---------------------------------------------------------------------------
+
+def _tx_row(tx_type, symbol):
+    """A Transactions data row (12 cols) with the given type/symbol."""
+    return ["2026-01-15", "2026-01-17", "Settled", "11A-00003", "CMA-Edge",
+            tx_type, "desc", symbol, "10", "150", "-1500", "a.csv"]
+
+
+def test_load_recorded_symbols_distinct_nonblank():
+    ws = _tab_mock(TAB_TRANSACTIONS, [
+        TRANSACTIONS_HEADERS,
+        _tx_row("BUY", "AAPL"),
+        _tx_row("SELL", "AAPL"),      # same symbol → deduped
+        _tx_row("DIVIDEND", "MCO"),
+        _tx_row("CASH_IN", ""),       # blank symbol → dropped
+    ])
+    sh = _sh_with_tabs(ws)
+    # distinct, blank dropped, order preserved; raw (caller normalizes/drops cash)
+    assert load_recorded_symbols(sh) == ["AAPL", "MCO"]
+
+
+def test_load_recorded_symbols_missing_tab():
+    sh = MagicMock()
+    sh.worksheets.return_value = []
+    assert load_recorded_symbols(sh) == []
+
+
+def test_load_watchlist_symbols_reads_symbol_column():
+    ws = _tab_mock(TAB_WATCHLIST, [
+        ["Symbol"],
+        ["PLTR"],
+        ["TSM"],
+        [""],        # blank skipped
+        ["PLTR"],    # dup skipped
+    ])
+    sh = _sh_with_tabs(ws)
+    assert load_watchlist_symbols(sh) == ["PLTR", "TSM"]
+
+
+def test_load_watchlist_symbols_missing_tab_creates_and_returns_empty():
+    ws = MagicMock()
+    ws.title = TAB_WATCHLIST
+    ws.get_all_values.return_value = [["Symbol"]]  # only header after creation
+    sh = MagicMock()
+    sh.worksheets.return_value = []                # tab missing → _ensure_tab creates it
+    sh.add_worksheet.return_value = ws
+    assert load_watchlist_symbols(sh) == []
+    sh.add_worksheet.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # write_transactions
 # ---------------------------------------------------------------------------
@@ -457,10 +538,12 @@ def test_write_holdings_googfinance_formulas():
     rows = ws.append_rows.call_args[0][0]
     assert len(rows) == 1
     row = rows[0]
-    # current_price formula references symbol in column D, row 2
-    assert 'GOOGLEFINANCE(D2,"price")' in row[7]
-    # market_value formula references quantity (E) and price (H)
-    assert "E2*H2" in row[8]
+    # symbol is now column C; current_price (col G) references it, row 2
+    assert 'GOOGLEFINANCE(C2,"price")' in row[6]
+    # market_value (col H) references quantity (D) and current_price (G)
+    assert "D2*G2" in row[7]
+    # as_of_date moved to the last column (I)
+    assert row[8] == date.today().isoformat()
 
 
 def test_write_holdings_empty_positions():
@@ -478,7 +561,7 @@ def test_write_holdings_sorted_by_account_then_symbol():
     ]
     write_holdings(sh, positions)
     rows = ws.append_rows.call_args[0][0]
-    symbols = [r[3] for r in rows]
+    symbols = [r[2] for r in rows]  # symbol is now column C (index 2)
     assert symbols == ["GOOG", "TSLA", "AAPL"]
 
 
@@ -518,9 +601,10 @@ def test_write_cash_drift_in_row():
     write_cash(sh, [bal])
     rows = ws.append_rows.call_args[0][0]
     row = rows[0]
-    assert row[5] == 1000.0   # reconstructed
-    assert row[6] == 990.0    # snapshot
-    assert row[7] == 10.0     # drift
+    assert row[4] == 1000.0   # reconstructed (col E)
+    assert row[5] == 990.0    # snapshot (col F)
+    assert row[6] == 10.0     # drift (col G)
+    assert row[7] == "2026-01-30"  # as_of_date moved to last column (H)
 
 
 def test_write_cash_no_snapshot():
@@ -535,8 +619,8 @@ def test_write_cash_no_snapshot():
     )
     write_cash(sh, [bal])
     rows = ws.append_rows.call_args[0][0]
-    assert rows[0][6] == ""   # snapshot empty
-    assert rows[0][7] == ""   # drift empty
+    assert rows[0][5] == ""   # snapshot empty (col F)
+    assert rows[0][6] == ""   # drift empty (col G)
 
 
 # ---------------------------------------------------------------------------
@@ -571,10 +655,19 @@ def test_write_stock_metrics_googfinance_formulas():
     write_stock_metrics(sh, _make_fundamentals(), date(2026, 1, 30))
     rows = ws.append_rows.call_args[0][0]
     row = rows[0]
-    # AAPL is in row 2, symbol in column B
-    assert 'GOOGLEFINANCE(B2,"price")' in row[11]   # current_price
-    assert 'GOOGLEFINANCE(B2,"high52")' in row[12]  # high_52wk
-    assert 'GOOGLEFINANCE(B2,"low52")' in row[13]   # low_52wk
+    # AAPL is in row 2, symbol now in column A; current_price (col K) references it
+    assert 'GOOGLEFINANCE(A2,"price")' in row[10]   # current_price
+    assert row[11] == "2026-01-30"  # as_of_date moved to last column (L)
+    # 52-week high/low GOOGLEFINANCE columns are gone
+    assert len(row) == len(STOCK_METRICS_HEADERS)
+    assert not any("high52" in str(c) or "low52" in str(c) for c in row)
+
+
+def test_write_stock_metrics_no_52wk_columns():
+    assert "52-Week High" not in STOCK_METRICS_HEADERS
+    assert "52-Week Low" not in STOCK_METRICS_HEADERS
+    assert STOCK_METRICS_HEADERS[0] == "Symbol"
+    assert STOCK_METRICS_HEADERS[-1] == "As Of Date"
 
 
 def test_write_stock_metrics_none_fields_written_as_empty():
@@ -590,9 +683,46 @@ def test_write_stock_metrics_none_fields_written_as_empty():
     write_stock_metrics(sh, fundamentals, date(2026, 1, 30))
     rows = ws.append_rows.call_args[0][0]
     row = rows[0]
-    # pe_ratio through book_value (indices 2-10) should all be ""
-    for i in range(2, 11):
+    assert row[0] == "IX"  # symbol now column A
+    # pe_ratio through book_value (indices 1-9) should all be ""
+    for i in range(1, 10):
         assert row[i] == "", f"index {i} should be empty"
+
+
+# ---------------------------------------------------------------------------
+# write_price_history
+# ---------------------------------------------------------------------------
+
+def _make_histories():
+    from portfolio.market.yfinance_client import PriceHistory
+    return {
+        "AAPL": PriceHistory("AAPL", ["2026-01-05", "2026-01-12"], [100.0, 105.0], "x"),
+        # disjoint + overlapping dates vs AAPL
+        "MSFT": PriceHistory("MSFT", ["2026-01-12", "2026-01-19"], [200.0, 210.0], "x"),
+    }
+
+
+def test_write_price_history_unified_date_axis():
+    sh, ws = _mock_sh_with_tab(TAB_PRICE_HISTORY)
+    write_price_history(sh, _make_histories())
+    ws.clear.assert_called_once()
+    # header: Date + symbols sorted alphabetically
+    assert ws.append_row.call_args[0][0] == ["Date", "AAPL", "MSFT"]
+    rows = ws.append_rows.call_args[0][0]
+    # unified, sorted date axis = union of both symbols' dates
+    assert [r[0] for r in rows] == ["2026-01-05", "2026-01-12", "2026-01-19"]
+    # alignment with blanks where a symbol lacks that date
+    assert rows[0] == ["2026-01-05", 100.0, ""]      # MSFT missing this date
+    assert rows[1] == ["2026-01-12", 105.0, 200.0]   # both present
+    assert rows[2] == ["2026-01-19", "", 210.0]      # AAPL missing this date
+
+
+def test_write_price_history_empty():
+    sh, ws = _mock_sh_with_tab(TAB_PRICE_HISTORY)
+    write_price_history(sh, {})
+    ws.clear.assert_called_once()
+    assert ws.append_row.call_args[0][0] == ["Date"]  # header only
+    ws.append_rows.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

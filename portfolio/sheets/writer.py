@@ -10,7 +10,7 @@ from portfolio.config import ACCOUNT_OWNERS
 from portfolio.models import CashBalance, Position, RunLogEntry, Transaction
 
 if TYPE_CHECKING:
-    from portfolio.market.yfinance_client import StockFundamentals
+    from portfolio.market.yfinance_client import PriceHistory, StockFundamentals
 
 logger = logging.getLogger(__name__)
 
@@ -24,35 +24,50 @@ TAB_HOLDINGS = "Holdings"
 TAB_CASH = "Cash"
 TAB_STOCK_METRICS = "Stock Metrics"
 TAB_RUN_LOG = "Run Log"
+TAB_WATCHLIST = "Watchlist"
+TAB_PRICE_HISTORY = "Price History"
 
+# Displayed header labels are Title Case (human-readable) and decoupled from the
+# internal field keys used for dedup read-back. Only the Transactions tab is ever
+# read back, so only it needs a parallel *_KEYS list; its column ORDER is unchanged
+# (no as_of_date), which keeps already-deployed sheets readable by position even
+# after the header is relabeled.
 TRANSACTIONS_HEADERS = [
+    "Trade Date", "Settlement Date", "Status", "Account Number",
+    "Account Registration", "Transaction Type", "Description", "Symbol",
+    "Quantity", "Price", "Amount", "Source File",
+]
+TRANSACTIONS_KEYS = [
     "trade_date", "settlement_date", "status", "account_number",
     "account_registration", "tx_type", "description", "symbol",
     "quantity", "price", "amount", "source_file",
 ]
-# A=as_of_date B=account_number C=account_registration D=symbol
-# E=quantity F=avg_cost G=cost_basis H=current_price I=market_value
+# A=Account Number B=Account Registration C=Symbol D=Quantity E=Average Cost
+# F=Cost Basis G=Current Price H=Market Value I=As Of Date
 HOLDINGS_HEADERS = [
-    "as_of_date", "account_number", "account_registration", "symbol",
-    "quantity", "avg_cost", "cost_basis", "current_price", "market_value",
+    "Account Number", "Account Registration", "Symbol", "Quantity",
+    "Average Cost", "Cost Basis", "Current Price", "Market Value", "As Of Date",
 ]
 CASH_HEADERS = [
-    "as_of_date", "account_number", "account_registration", "owner",
-    "cash_account", "reconstructed", "snapshot", "drift",
+    "Account Number", "Account Registration", "Owner", "Cash Account",
+    "Reconstructed", "Snapshot", "Drift", "As Of Date",
 ]
-# A=as_of_date B=symbol C=pe_ratio D=dividend_yield E=roe_current
-# F=roe_1y G=roe_2y H=roe_3y I=roe_4y J=net_income K=book_value
-# L=current_price M=high_52wk N=low_52wk
+# A=Symbol B=P/E Ratio C=Dividend Yield D=ROE (Current) E=ROE (1Y Ago)
+# F=ROE (2Y Ago) G=ROE (3Y Ago) H=ROE (4Y Ago) I=Net Income J=Book Value
+# K=Current Price L=As Of Date
+# 5-year weekly closes live on the separate Price History tab (fetched by Python).
 STOCK_METRICS_HEADERS = [
-    "as_of_date", "symbol", "pe_ratio", "dividend_yield",
-    "roe_current", "roe_1y", "roe_2y", "roe_3y", "roe_4y",
-    "net_income", "book_value", "current_price", "high_52wk", "low_52wk",
+    "Symbol", "P/E Ratio", "Dividend Yield", "ROE (Current)",
+    "ROE (1Y Ago)", "ROE (2Y Ago)", "ROE (3Y Ago)", "ROE (4Y Ago)",
+    "Net Income", "Book Value", "Current Price", "As Of Date",
 ]
 RUN_LOG_HEADERS = [
-    "run_timestamp", "files_processed", "init_rows_added", "transactions_added",
-    "accounts_skipped", "errors", "holdings_changed", "cash_reconciliation",
-    "duration_sec", "notes",
+    "Run Timestamp", "Files Processed", "Init Rows Added", "Transactions Added",
+    "Accounts Skipped", "Errors", "Holdings Changed", "Cash Reconciliation",
+    "Duration (Sec)", "Notes",
 ]
+# Human-maintained intake tab: one ticker per row under "Symbol".
+WATCHLIST_HEADERS = ["Symbol"]
 
 
 def get_gspread_client(credentials=None):
@@ -157,19 +172,41 @@ def _row_canonical_key(row: dict[str, str]) -> tuple[str, ...]:
     )
 
 
-def _read_tab_rows(ws: gspread.Worksheet) -> list[dict[str, str]]:
-    """Return all data rows as dicts (header row → keys). Skips blank rows."""
+def _read_tab_rows(
+    ws: gspread.Worksheet, keys: list[str] | None = None
+) -> list[dict[str, str]]:
+    """Return all data rows as dicts. Skips blank rows.
+
+    When ``keys`` is given, each row is keyed by POSITION against ``keys`` — the
+    sheet's header row is skipped but otherwise ignored. This decouples the dict
+    keys from the displayed header text, so relabeling a tab's header (e.g.
+    snake_case → Title Case) cannot change dedup behavior on an already-deployed
+    sheet. When ``keys`` is None, the sheet's own header row supplies the keys.
+    """
     all_values = ws.get_all_values()
     if len(all_values) < 2:
         return []
-    headers, *data_rows = all_values
+    header, *data_rows = all_values
+    field_keys = keys if keys is not None else header
     result = []
     for row in data_rows:
-        padded = row + [""] * (len(headers) - len(row))
-        d = dict(zip(headers, padded))
+        padded = row + [""] * (len(field_keys) - len(row))
+        d = dict(zip(field_keys, padded))
         if any(v.strip() for v in d.values()):
             result.append(d)
     return result
+
+
+def _refresh_header(ws, headers: list[str]) -> None:
+    """Overwrite row 1 with ``headers``.
+
+    Cosmetic only — keeps append-only tabs (Transactions, Run Log) showing the
+    current Title Case labels even though ``_ensure_tab`` writes a header only on
+    creation. Correctness never depends on this: reads are position-based.
+    Keyword args are required because gspread v5/v6 swap the positional order of
+    ``range_name`` and ``values``.
+    """
+    ws.update(values=[headers], range_name="A1", value_input_option="USER_ENTERED")
 
 
 def load_existing_transaction_keys(sh) -> set[tuple]:
@@ -178,7 +215,7 @@ def load_existing_transaction_keys(sh) -> set[tuple]:
     if TAB_TRANSACTIONS not in ws_names:
         return set()
     ws = sh.worksheet(TAB_TRANSACTIONS)
-    return {_row_canonical_key(row) for row in _read_tab_rows(ws)}
+    return {_row_canonical_key(row) for row in _read_tab_rows(ws, TRANSACTIONS_KEYS)}
 
 
 def load_existing_source_files(sh) -> set[str]:
@@ -192,9 +229,57 @@ def load_existing_source_files(sh) -> set[str]:
     ws = sh.worksheet(TAB_TRANSACTIONS)
     return {
         row["source_file"].strip()
-        for row in _read_tab_rows(ws)
+        for row in _read_tab_rows(ws, TRANSACTIONS_KEYS)
         if row.get("source_file", "").strip()
     }
+
+
+def load_recorded_symbols(sh) -> list[str]:
+    """Distinct symbols recorded in the Transactions tab (held OR since sold).
+
+    Read position-based against ``TRANSACTIONS_KEYS`` so it's immune to header
+    relabels. Returns RAW symbol strings (Merrill form), order-preserving; the
+    caller normalizes and drops cash/blank (via ``normalize_all``).
+    """
+    ws_names = {ws.title for ws in sh.worksheets()}
+    if TAB_TRANSACTIONS not in ws_names:
+        return []
+    ws = sh.worksheet(TAB_TRANSACTIONS)
+    out: list[str] = []
+    seen: set[str] = set()
+    for row in _read_tab_rows(ws, TRANSACTIONS_KEYS):
+        sym = row.get("symbol", "").strip()
+        if sym and sym not in seen:
+            seen.add(sym)
+            out.append(sym)
+    return out
+
+
+def load_watchlist_symbols(sh) -> list[str]:
+    """Symbols from the human-editable Watchlist tab (single ``Symbol`` column).
+
+    Ensures the tab exists (created with a ``Symbol`` header if missing — never
+    clobbers user rows). Returns RAW symbol strings, order-preserving; the caller
+    normalizes and drops cash/blank. Locates the column whose header is ``Symbol``
+    (case-insensitive); falls back to the first column.
+    """
+    ws = _ensure_tab(sh, TAB_WATCHLIST, WATCHLIST_HEADERS)
+    all_values = ws.get_all_values()
+    if len(all_values) < 2:
+        return []
+    header, *data_rows = all_values
+    col = next(
+        (i for i, label in enumerate(header) if label.strip().lower() == "symbol"),
+        0,
+    )
+    out: list[str] = []
+    seen: set[str] = set()
+    for row in data_rows:
+        sym = row[col].strip() if col < len(row) else ""
+        if sym and sym not in seen:
+            seen.add(sym)
+            out.append(sym)
+    return out
 
 
 def write_transactions(
@@ -209,6 +294,7 @@ def write_transactions(
     used by ``load_existing_transaction_keys``.
     """
     ws = _ensure_tab(sh, TAB_TRANSACTIONS, TRANSACTIONS_HEADERS)
+    _refresh_header(ws, TRANSACTIONS_HEADERS)
 
     new_rows = []
     for tx in transactions:
@@ -246,15 +332,15 @@ def write_holdings(sh: gspread.Spreadsheet, positions: list[Position]) -> None:
     for i, pos in enumerate(sorted(positions, key=lambda p: (p.account_number, p.symbol))):
         row_num = i + 2  # row 1 is the header
         rows.append([
-            today,
-            pos.account_number,
-            pos.account_registration,
-            pos.symbol,
-            round(pos.quantity, 8),
-            round(pos.avg_cost, 6),
-            round(pos.total_cost_basis, 2),
-            f'=IFERROR(GOOGLEFINANCE(D{row_num},"price"),0)',
-            f'=IFERROR(E{row_num}*H{row_num},0)',
+            pos.account_number,                                # A
+            pos.account_registration,                          # B
+            pos.symbol,                                        # C
+            round(pos.quantity, 8),                            # D
+            round(pos.avg_cost, 6),                            # E
+            round(pos.total_cost_basis, 2),                    # F
+            f'=IFERROR(GOOGLEFINANCE(C{row_num},"price"),0)',  # G current_price
+            f'=IFERROR(D{row_num}*G{row_num},0)',              # H market_value
+            today,                                             # I as_of_date
         ])
 
     if rows:
@@ -271,14 +357,14 @@ def write_cash(sh: gspread.Spreadsheet, balances: list[CashBalance]) -> None:
     for bal in sorted(balances, key=lambda b: (b.account_number, b.cash_account)):
         owner = ACCOUNT_OWNERS.get(bal.account_number, "")
         rows.append([
-            bal.as_of_date.isoformat(),
-            bal.account_number,
-            bal.account_registration,
-            owner,
-            bal.cash_account,
-            round(bal.reconstructed, 2),
-            "" if bal.snapshot is None else round(bal.snapshot, 2),
-            "" if bal.drift is None else round(bal.drift, 2),
+            bal.account_number,                                      # A
+            bal.account_registration,                               # B
+            owner,                                                  # C
+            bal.cash_account,                                       # D
+            round(bal.reconstructed, 2),                            # E
+            "" if bal.snapshot is None else round(bal.snapshot, 2),  # F
+            "" if bal.drift is None else round(bal.drift, 2),        # G
+            bal.as_of_date.isoformat(),                             # H as_of_date
         ])
 
     if rows:
@@ -298,31 +384,66 @@ def write_stock_metrics(
     rows = []
     for i, (symbol, f) in enumerate(sorted(fundamentals.items())):
         row_num = i + 2
-        sym_ref = f"B{row_num}"
+        sym_ref = f"A{row_num}"
         rows.append([
-            run_date.isoformat(),
-            symbol,
-            "" if f.pe_ratio is None else f.pe_ratio,
-            "" if f.dividend_yield is None else f.dividend_yield,
-            "" if f.roe_current is None else f.roe_current,
-            "" if f.roe_1y is None else f.roe_1y,
-            "" if f.roe_2y is None else f.roe_2y,
-            "" if f.roe_3y is None else f.roe_3y,
-            "" if f.roe_4y is None else f.roe_4y,
-            "" if f.net_income is None else f.net_income,
-            "" if f.book_value is None else f.book_value,
-            f'=IFERROR(GOOGLEFINANCE({sym_ref},"price"),"N/A")',
-            f'=IFERROR(GOOGLEFINANCE({sym_ref},"high52"),"N/A")',
-            f'=IFERROR(GOOGLEFINANCE({sym_ref},"low52"),"N/A")',
+            symbol,                                                # A
+            "" if f.pe_ratio is None else f.pe_ratio,             # B
+            "" if f.dividend_yield is None else f.dividend_yield,  # C
+            "" if f.roe_current is None else f.roe_current,        # D
+            "" if f.roe_1y is None else f.roe_1y,                  # E
+            "" if f.roe_2y is None else f.roe_2y,                  # F
+            "" if f.roe_3y is None else f.roe_3y,                  # G
+            "" if f.roe_4y is None else f.roe_4y,                  # H
+            "" if f.net_income is None else f.net_income,          # I
+            "" if f.book_value is None else f.book_value,          # J
+            f'=IFERROR(GOOGLEFINANCE({sym_ref},"price"),"N/A")',   # K current_price
+            run_date.isoformat(),                                  # L as_of_date
         ])
 
     if rows:
         ws.append_rows(rows, value_input_option="USER_ENTERED")
 
 
+def write_price_history(
+    sh: gspread.Spreadsheet,
+    histories: dict[str, PriceHistory],
+) -> None:
+    """Overwrite the Price History tab with 5-yr weekly closes (one column per symbol).
+
+    Builds a unified, sorted Date axis (the union of every symbol's dates) so symbols
+    with different history lengths still align — blanks fill the gaps. Date is column
+    A; symbols are the remaining columns, sorted alphabetically (matching Stock Metrics).
+    """
+    ws = _ensure_tab(sh, TAB_PRICE_HISTORY, ["Date"])
+    ws.clear()
+
+    symbols = sorted(histories)
+    by_symbol: dict[str, dict[str, float]] = {}
+    all_dates: set[str] = set()
+    for sym in symbols:
+        h = histories[sym]
+        pairs = dict(zip(h.dates, h.closes))
+        by_symbol[sym] = pairs
+        all_dates.update(pairs)
+
+    ws.append_row(["Date", *symbols], value_input_option="USER_ENTERED")
+
+    rows = []
+    for d in sorted(all_dates):
+        row = [d]
+        for sym in symbols:
+            close = by_symbol[sym].get(d)
+            row.append("" if close is None else close)
+        rows.append(row)
+
+    if rows:
+        ws.append_rows(rows, value_input_option="RAW")
+
+
 def write_run_log(sh: gspread.Spreadsheet, entry: RunLogEntry) -> None:
     """Append one row to the Run Log tab."""
     ws = _ensure_tab(sh, TAB_RUN_LOG, RUN_LOG_HEADERS)
+    _refresh_header(ws, RUN_LOG_HEADERS)
     ws.append_row(
         [
             entry.run_timestamp,

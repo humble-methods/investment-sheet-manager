@@ -260,9 +260,10 @@ Merrill uses standard US ticker symbols for ADRs (`IX`, `TM`, `LYG`, `TSM`, etc.
 ├── upload/                   # ID: <DRIVE_UPLOAD_FOLDER_ID>
 ├── processed/                # ID: <DRIVE_PROCESSED_FOLDER_ID>
 ├── failed/                   # ID: <DRIVE_FAILED_FOLDER_ID>
-└── cache/                    # ID: <DRIVE_CACHE_FOLDER_ID>
-    ├── yfinance_cache.json   # yfinance fundamentals cache (24hr TTL)
-    └── account_state.json    # per-account init dates + bootstrap source files (permanent)
+└── cache/                       # ID: <DRIVE_CACHE_FOLDER_ID>
+    ├── yfinance_cache.json       # yfinance fundamentals cache (24hr TTL)
+    ├── price_history_cache.json  # 5-yr weekly closing-price cache (24hr TTL)
+    └── account_state.json        # per-account init dates + bootstrap source files (permanent)
 ```
 
 ---
@@ -276,14 +277,15 @@ Merrill uses standard US ticker symbols for ADRs (`IX`, `TM`, `LYG`, `TSM`, etc.
 | `Transactions` | All normalized transactions (INIT_BUY + activity). One row per event. |
 | `Holdings` | Current position summary per account. Derived by replaying Transactions. |
 | `Cash` | Per-account cash (CMA sweep 990156937 / Roth IIAXX): reconstructed vs snapshot + drift. |
-| `Stock Metrics` | Combined metrics + ROE per ticker. Prices via GOOGLEFINANCE formulas. |
+| `Stock Metrics` | Fundamentals + ROE per ticker for **every recorded symbol (held or since sold) + Watchlist**. Current price via GOOGLEFINANCE; fundamentals via yfinance. |
+| `Price History` | 5-year weekly closing prices (yfinance, Python-fetched values). One column per symbol on a shared `Date` axis. |
 | `Run Log` | One row per run: timestamp, files processed, errors, holdings delta, skipped accounts, cash reconciliation. |
 
 **Editable tabs (human-maintained):**
 
 | Tab | Description |
 |-----|-------------|
-| `Watchlist` | Optional: tickers to track even if not held. |
+| `Watchlist` | Tickers to track even if not held. **Read each run** and unioned into Stock Metrics + Price History. Single `Symbol` column; auto-created if missing, never overwritten. |
 
 Note: configuration (Drive folder IDs, spreadsheet ID, toggles) lives in `portfolio/config.py`,
 not a Settings tab — keep operational config in code. Per-account init dates are runtime state
@@ -293,32 +295,40 @@ in Drive `cache/account_state.json`, not the sheet.
 
 ## Google Sheets Column Schemas
 
+Headers are **Title Case** (human-readable); internal dedup read-back is by **column position**, not
+header text (see Non-Obvious Behaviors). `As Of Date` is the **last** column on Holdings/Cash/Stock Metrics.
+
 ### Transactions tab
-`trade_date | settlement_date | status | account_number | account_registration | tx_type | description | symbol | quantity | price | amount | source_file`
+`Trade Date | Settlement Date | Status | Account Number | Account Registration | Transaction Type | Description | Symbol | Quantity | Price | Amount | Source File`
+
+Column **order is load-bearing** — `TRANSACTIONS_KEYS` (writer.py) maps these positions to internal
+field names on read-back. Never reorder.
 
 ### Holdings tab
-`as_of_date | account_number | account_registration | symbol | quantity | avg_cost | cost_basis`
+`Account Number | Account Registration | Symbol | Quantity | Average Cost | Cost Basis | Current Price | Market Value | As Of Date`
 
-Note: Current price and market value are NOT stored here — they're computed live in Google Sheets using GOOGLEFINANCE formulas in adjacent columns.
+Note: Current Price / Market Value are GOOGLEFINANCE formulas (symbol in col C): `=IFERROR(GOOGLEFINANCE(C2,"price"),0)`.
 
 ### Cash tab
-`as_of_date | account_number | account_registration | owner | cash_account | reconstructed | snapshot | drift`
+`Account Number | Account Registration | Owner | Cash Account | Reconstructed | Snapshot | Drift | As Of Date`
 
 `cash_account` is `990156937` (CMA sweep) or `IIAXX` (Roth). `reconstructed` replays activity from
 the bootstrap; `snapshot` is from the latest Holdings CSV (blank if none this run); `drift` flags mismatch.
 
 ### Stock Metrics tab
-Python writes these columns (from yfinance, updated each run):
-`as_of_date | symbol | pe_ratio | dividend_yield | roe_current | roe_1y | roe_2y | roe_3y | roe_4y | net_income | book_value`
+Covers **every recorded symbol (held or sold) + Watchlist**. Python writes (from yfinance, each run):
+`Symbol | P/E Ratio | Dividend Yield | ROE (Current) | ROE (1Y Ago) | ROE (2Y Ago) | ROE (3Y Ago) | ROE (4Y Ago) | Net Income | Book Value | Current Price | As Of Date`
 
-Google Sheets GOOGLEFINANCE formulas live in additional columns (not written by Python):
-- Current price: `=GOOGLEFINANCE(B2, "price")`
-- 52-week high: `=GOOGLEFINANCE(B2, "high52")`
-- 52-week low: `=GOOGLEFINANCE(B2, "low52")`
-- 5-year price history: Written as a separate range using `=GOOGLEFINANCE(B2, "price", TODAY()-5*365, TODAY(), "WEEKLY")`
+- Current Price is a GOOGLEFINANCE formula (symbol in col A): `=IFERROR(GOOGLEFINANCE(A2, "price"), "N/A")`
+- The 52-week high/low columns were **removed**; 5-year history now lives on the Price History tab.
+
+### Price History tab
+5-year **weekly closing prices** fetched by Python/yfinance and written as **values** (not formulas):
+`Date | <symbol 1> | <symbol 2> | …` — one row per weekly date on a unified, sorted `Date` axis (the
+union of all symbols' dates; blank where a symbol lacks that week). Symbols sorted alphabetically.
 
 ### Run Log tab
-`run_timestamp | files_processed | init_rows_added | transactions_added | accounts_skipped | errors | holdings_changed | cash_reconciliation | duration_sec | notes`
+`Run Timestamp | Files Processed | Init Rows Added | Transactions Added | Accounts Skipped | Errors | Holdings Changed | Cash Reconciliation | Duration (Sec) | Notes`
 
 ---
 
@@ -367,18 +377,17 @@ Google Sheets GOOGLEFINANCE formulas live in additional columns (not written by 
 - Sells deplete oldest lots first within the same account
 - Holdings recomputed from scratch each run by replaying full transaction history
 
-### Price Data via GOOGLEFINANCE (Not Python)
-- Current prices and historical price series are NOT fetched by Python
-- Google Sheets GOOGLEFINANCE formulas handle all price data — faster, always fresh
-- Python only writes fundamental data (ROE, P/E, dividend yield) from yfinance
-- ROE history: 4 years of annual ROE data written to Stock Metrics tab
+### Price Data: current via GOOGLEFINANCE, 5-yr history via Python
+- **Current** price: GOOGLEFINANCE formulas in the sheet (Holdings, Stock Metrics) — always fresh, no Python live-quote calls.
+- **5-year weekly closing history:** fetched by Python/yfinance into the `Price History` tab. A date-ranged series is a 2-D spill that can't fit a one-row-per-symbol tab, and the closes are wanted as values.
+- The 52-week high/low GOOGLEFINANCE columns were **removed** in favor of the full history.
+- Python also writes fundamentals (ROE, P/E, dividend yield, net income, book value); ROE history = 4 years.
 
 ### yfinance Caching
-- Cache stored in Google Drive as `cache/yfinance_cache.json`
-- Cache key: ticker symbol (normalized)
-- Cached fields: pe_ratio, dividend_yield, roe (current + 4 prior years), net_income, book_value, fetched_at
-- Cache TTL: 24 hours
-- On yfinance failure: keep stale data, log warning
+- **Two** Drive caches, each keyed by normalized ticker, 24hr TTL, keep-stale-on-failure:
+  - `cache/yfinance_cache.json` — fundamentals (pe_ratio, dividend_yield, roe current+4y, net_income, book_value, fetched_at)
+  - `cache/price_history_cache.json` — 5-yr weekly closes (symbol, dates[], closes[], fetched_at)
+- On yfinance failure: keep stale data, log warning (per symbol; an empty record is NOT cached, so the next run retries)
 
 ### CSV File Movement
 - On success: move to `processed/YYYYMMDD_HHMMSS_<original_filename>`
@@ -441,6 +450,8 @@ Google Sheets GOOGLEFINANCE formulas live in additional columns (not written by 
 20. **New/un-bootstrapped accounts**: An account can appear in an activity statement with no prior bootstrap. Skip + flag it until BOTH an Unrealized (equity lots + init date) and a Holdings (cash init) intake bootstrap it; never crash, never partially process.
 
 21. **CSV type detection is filename-first, then header-sniffing**: `detect_csv_type()` matches known Merrill prefixes (`PendingAndSettledActivity`/`Settled`→activity, `Holdings`, `Realized`, `Unrealized`); if the name doesn't match AND a filepath is given, it sniffs the header row (utf-8-sig). Fallback order is load-bearing: `Trade Date`→activity, `Unit Cost ($)`→unrealized, `Liquidation Date`→realized, `Price ($)`→holdings — `Price ($)` is checked LAST because activity rows also have it. Filename always wins over content. Without the fallback, user-renamed files (e.g. `activity_1.csv`) classify as `unknown` and are silently skipped → 0 rows processed on first run. Always pass the local path: `detect_csv_type(name, path)`.
+
+22. **Sheet header labels are decoupled from dedup keys**: Output headers are Title Case for humans, but the Transactions dedup reads rows back by **column position** against `TRANSACTIONS_KEYS` (writer.py), NOT by header text — which is why relabeling headers (snake_case → Title Case) is safe on an already-deployed sheet. Two invariants follow: (a) **never reorder Transactions columns** or change `TRANSACTIONS_KEYS` — existing rows would mis-map and re-import as duplicates; (b) `As Of Date` is last on Holdings/Cash/Stock Metrics, which are clear-and-rewrite (safe to reorder). Append-only tabs (Transactions, Run Log) get row 1 re-written each run via `_refresh_header` so the visible header stays current. The regression guard is `test_dedup_readback_is_position_based`.
 
 ---
 

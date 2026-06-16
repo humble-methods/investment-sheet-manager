@@ -52,6 +52,12 @@ Activity is a strict superset for the ongoing flow (BUY/SELL **plus** dividends,
 ### Corporate actions: out of scope for MVP (confirmed)
 Splits / renames / mergers are handled by **manual intervention** — the user re-pulls and adjusts position files when one occurs. The engine should **flag unmapped `(Type, Description 1)` combos** as `UNKNOWN` rather than attempt to handle them.
 
+### Price strategy: current via GOOGLEFINANCE, history via Python (Phase 11, partial reversal)
+The original rule ("all price data via GOOGLEFINANCE; Python never fetches prices") is **partially reversed**: **5-year weekly historical closes are fetched by Python/yfinance** and written to a dedicated `Price History` tab, while the **current price stays a live GOOGLEFINANCE formula** on Holdings and Stock Metrics. Rationale: a date-ranged series is a 2-D spill that can't live one-row-per-symbol, and the user wants the raw closes available as values. The 52-week high/low GOOGLEFINANCE columns are removed in favor of the full history. (Amends the Phase 4/5 notes below.)
+
+### Metrics scope: all recorded symbols + watchlist (Phase 10)
+Stock Metrics and Price History cover **every symbol ever recorded in the Transactions tab (held OR since sold)** unioned with a human-editable **`Watchlist` tab** (single `Symbol` column), minus cash. This broadens the original "held symbols only" scope.
+
 ---
 
 ## Phase 1 — Project Foundation
@@ -659,6 +665,8 @@ def get_gspread_client(credentials=None) -> gspread.Client:
 On first run (tabs don't exist yet), create each tab and write the header row.
 
 ### Writer functions
+> **Note:** The column orders and snake_case header labels shown below are the original Phase-5 layout. **Phases 9–11 supersede them** — Title Case headers, `as_of_date` moved last, 52-week high/low removed, and a new `Price History` tab. See those phases for the current schema.
+
 ```python
 def write_transactions(
     sh: gspread.Spreadsheet,
@@ -713,7 +721,9 @@ def write_run_log(sh: gspread.Spreadsheet, entry: RunLogEntry) -> None:
 ```
 
 ### GOOGLEFINANCE formula strategy
-Python writes `=IFERROR(GOOGLEFINANCE(B2,"price"),"N/A")` as a string value into cells. Google Sheets treats strings starting with `=` as formulas. This keeps price data always-fresh without Python making any price API calls.
+Python writes `=IFERROR(GOOGLEFINANCE(B2,"price"),"N/A")` as a string value into cells. Google Sheets treats strings starting with `=` as formulas. This keeps the **current** price always-fresh without Python making live-quote API calls.
+
+> **Partially superseded by Phase 11:** the current price stays a GOOGLEFINANCE formula, but the 52-week high/low formulas are removed and **5-year weekly historical closes are now fetched by Python/yfinance** into a `Price History` tab. After Phase 9 the symbol cell refs also shift (Holdings symbol→C, Stock Metrics symbol→A).
 
 ### Validation
 - Run writer against a test Sheet
@@ -845,6 +855,102 @@ run_update(credentials=credentials)
 
 ---
 
+## Phase 9 — Human-Readable Headers + `as_of_date` Last (dedup-safe)
+**Goal:** Title Case labels on every output tab and `as_of_date` as the LAST column, without breaking the Transactions dedup that reads rows back from the sheet.
+
+### Deliverables
+- `portfolio/sheets/writer.py` (updated)
+- `tests/test_writer.py` (updated)
+
+### The migration trap (why this is sequenced first)
+The Transactions tab is append-only and deduped by reading existing rows back. `_read_tab_rows` keyed each row dict off the sheet's **header text**, and `_row_canonical_key` looks up `row["trade_date"]`, `row["tx_type"]`, etc. Relabeling the header on an **already-deployed** sheet (whose header row is still snake_case when read, before any rewrite) would fail every dedup match and **mass-reimport duplicate transactions**. Only the Transactions tab is read back; Holdings/Cash/Stock Metrics/Run Log are write-only, so reordering their columns is safe.
+
+### Changes
+- Display labels (`*_HEADERS`) are now **Title Case in the new column order**; a parallel `TRANSACTIONS_KEYS` holds the stable snake_case field names in the **unchanged** Transactions order.
+- `_read_tab_rows(ws, keys=None)` keys rows by **position** against `keys` when given (the sheet's header row is skipped but ignored); the Transactions readers pass `TRANSACTIONS_KEYS`. `_row_canonical_key` is unchanged.
+- `write_holdings` / `write_cash` / `write_stock_metrics` reorder with `as_of_date` last and fix the GOOGLEFINANCE cell refs (Holdings: symbol→C ⇒ `GOOGLEFINANCE(C{r},"price")`, market value `D{r}*G{r}`; Stock Metrics: symbol→A).
+- `_refresh_header(ws, headers)` rewrites row 1 on the append-only tabs (Transactions, Run Log) so their visible header switches to Title Case — cosmetic only; correctness is position-based. Keyword args (`values=`, `range_name=`) for gspread v5/v6 compatibility.
+
+### Final tab headers (Title Case)
+- **Transactions** (order unchanged): `Trade Date | Settlement Date | Status | Account Number | Account Registration | Transaction Type | Description | Symbol | Quantity | Price | Amount | Source File`
+- **Holdings**: `Account Number | Account Registration | Symbol | Quantity | Average Cost | Cost Basis | Current Price | Market Value | As Of Date`
+- **Cash**: `Account Number | Account Registration | Owner | Cash Account | Reconstructed | Snapshot | Drift | As Of Date`
+- **Stock Metrics**: `Symbol | P/E Ratio | Dividend Yield | ROE (Current) | ROE (1Y Ago) | ROE (2Y Ago) | ROE (3Y Ago) | ROE (4Y Ago) | Net Income | Book Value | Current Price | As Of Date`
+- **Run Log** (order unchanged; `Run Timestamp` is the log key, not an as_of_date): `Run Timestamp | Files Processed | Init Rows Added | Transactions Added | Accounts Skipped | Errors | Holdings Changed | Cash Reconciliation | Duration (Sec) | Notes`
+
+### Tests
+- `test_dedup_readback_is_position_based`: the OLD snake_case header AND the NEW Title Case header both yield identical dedup keys (the regression guard).
+- Updated formula/column-index assertions across Holdings/Cash/Stock Metrics.
+
+### Validation
+```bash
+python3 -m pytest tests/test_writer.py -q   # use python3, not the 3.9 .venv
+```
+
+---
+
+## Phase 10 — Broaden Metrics Scope + Watchlist Intake
+**Goal:** Stock Metrics covers **every recorded symbol (held OR since sold)** plus a human-editable watchlist — not just currently-held positions.
+
+### Deliverables
+- `portfolio/sheets/writer.py` (`load_recorded_symbols`, `load_watchlist_symbols`, `TAB_WATCHLIST`, `WATCHLIST_HEADERS`)
+- `portfolio/runner.py` (symbol-collection rewrite)
+- `tests/test_writer.py` (updated)
+
+### Changes
+- `load_recorded_symbols(sh)` → distinct non-blank `symbol` values from the Transactions tab (read position-based via `TRANSACTIONS_KEYS`); `[]` if the tab is missing. Raw symbols — caller normalizes.
+- `load_watchlist_symbols(sh)` → `_ensure_tab(sh, "Watchlist", ["Symbol"])` (creates the tab with a `Symbol` header if missing, never clobbers user rows), then reads the `Symbol` column (case-insensitive header match; default col 0).
+- `runner.py` step 16 (run **after** transactions are written so this run's new symbols count):
+  ```python
+  recorded  = load_recorded_symbols(sh)
+  watchlist = load_watchlist_symbols(sh)
+  symbols   = normalize_all([*recorded, *watchlist])   # dedups, drops cash/blank, BRKB→BRK-B
+  ```
+  `recorded ⊇ held` (no holding without a recorded BUY/INIT_BUY), so coverage strictly broadens. The same `symbols` list feeds both `fetch_fundamentals` and `fetch_price_history`.
+
+### Tests
+- `test_load_recorded_symbols_distinct_nonblank`, `test_load_recorded_symbols_missing_tab`.
+- `test_load_watchlist_symbols_reads_symbol_column`, `test_load_watchlist_symbols_missing_tab_creates_and_returns_empty`.
+
+### Validation
+```bash
+python3 -m pytest tests/test_writer.py -q
+```
+
+---
+
+## Phase 11 — 5-Year Weekly Closes via yfinance → `Price History` tab
+**Goal:** Replace the `high_52wk` / `low_52wk` GOOGLEFINANCE columns with **5 years of weekly closing prices fetched in Python** (yfinance); keep `current_price` as a live GOOGLEFINANCE formula. See the **Price strategy** Locked Decision above.
+
+### Deliverables
+- `portfolio/market/yfinance_client.py` (`PriceHistory`, `fetch_price_history`, `_fetch_history_one`)
+- `portfolio/drive/archiver.py` (`load_price_history_cache`, `save_price_history_cache`)
+- `portfolio/sheets/writer.py` (`write_price_history`, `TAB_PRICE_HISTORY`; 52wk columns removed)
+- `portfolio/runner.py` (fetch + write wiring)
+- `tests/test_yfinance_client.py`, `tests/test_writer.py` (updated)
+
+### Changes
+- `fetch_price_history(symbols, cache, ttl_hours=24, period="5y", interval="1wk") -> {symbol: PriceHistory}` mirrors `fetch_fundamentals`' cache-first / stale-on-failure flow and reuses the monkeypatchable `_ticker`. `_fetch_history_one` → `ticker.history(period, interval, auto_adjust=False)`, takes `Close`, converts the DatetimeIndex to ISO dates, drops NaNs.
+- Second Drive cache file `price_history_cache.json` (`_CACHE_PRICE_HISTORY`) with `load_/save_price_history_cache` wrappers over `_load_json`/`_save_json`.
+- `write_price_history(sh, histories)` clears the `Price History` tab and builds a **unified, sorted Date axis** (the union of every symbol's dates) so symbols with different history lengths align; blanks fill the gaps. `Date` is column A; symbols are the remaining columns, sorted alphabetically.
+- `STOCK_METRICS_HEADERS` and `write_stock_metrics` drop `52-Week High` / `52-Week Low` (`current_price` stays).
+
+### Cache format (`price_history_cache.json`)
+```json
+{ "AAPL": { "symbol": "AAPL", "dates": ["2021-06-14", "..."], "closes": [129.6, "..."], "fetched_at": "2026-06-15T10:00:00" } }
+```
+
+### Tests
+- `test_yfinance_client.py`: `FakeTicker` gains a `.history()` method; cache-miss / NaN-skip / fresh-skip / stale-refetch / failure-keeps-stale / failure-no-cache / normalize-dedup for `fetch_price_history`.
+- `test_writer.py`: `test_write_price_history_unified_date_axis` (overlapping + disjoint dates align with blanks), `test_write_price_history_empty`, `test_write_stock_metrics_no_52wk_columns`.
+
+### Validation
+```bash
+python3 -m pytest -q   # full suite green
+```
+
+---
+
 ## Phase Sequence & Dependencies
 
 ```
@@ -857,6 +963,12 @@ Phase 1 (Foundation)
             └── Phase 4 (Market Data)  ← can start in parallel with Phase 3
                     └── feeds into Phase 5 (Stock Metrics tab)
                     └── Phase 8 (Hardening)
+
+Post-MVP enhancements (sequence by dependency, not number):
+Phase 9 (Human headers, dedup-safe reads)
+    └── Phase 10 (Metrics scope + Watchlist)  ← uses Phase 9's TRANSACTIONS_KEYS reads
+            └── Phase 11 (5-yr Price History)  ← consumes Phase 10's symbol set
+Phase 8 (Hardening) is orthogonal — do it before or after 9–11.
 ```
 
 ---

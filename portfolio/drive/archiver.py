@@ -14,6 +14,7 @@ from googleapiclient.http import MediaInMemoryUpload, MediaIoBaseDownload
 logger = logging.getLogger(__name__)
 
 _CACHE_YFINANCE = "yfinance_cache.json"
+_CACHE_PRICE_HISTORY = "price_history_cache.json"
 _CACHE_ACCOUNT_STATE = "account_state.json"
 
 
@@ -86,6 +87,16 @@ def load_yfinance_cache(service, cache_folder_id: str) -> dict:
 def save_yfinance_cache(service, cache_folder_id: str, cache: dict) -> None:
     """Upload/overwrite yfinance_cache.json in the Drive cache folder."""
     _save_json(service, cache_folder_id, _CACHE_YFINANCE, cache)
+
+
+def load_price_history_cache(service, cache_folder_id: str) -> dict:
+    """Download price_history_cache.json from the Drive cache folder. Return {} if not found."""
+    return _load_json(service, cache_folder_id, _CACHE_PRICE_HISTORY)
+
+
+def save_price_history_cache(service, cache_folder_id: str, cache: dict) -> None:
+    """Upload/overwrite price_history_cache.json in the Drive cache folder."""
+    _save_json(service, cache_folder_id, _CACHE_PRICE_HISTORY, cache)
 
 
 def load_account_state(service, cache_folder_id: str) -> dict:

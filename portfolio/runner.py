@@ -16,15 +16,18 @@ from portfolio.drive.archiver import (
     download_csv,
     list_pending_csvs,
     load_account_state,
+    load_price_history_cache,
     load_yfinance_cache,
     move_to_failed,
     move_to_processed,
     save_account_state,
+    save_price_history_cache,
     save_yfinance_cache,
 )
 from portfolio.engine.cash import reconcile_cash, reconstruct_cash
 from portfolio.engine.holdings import compute_holdings, verify_against_snapshot
-from portfolio.market.yfinance_client import fetch_fundamentals
+from portfolio.market.symbol_overrides import normalize_all
+from portfolio.market.yfinance_client import fetch_fundamentals, fetch_price_history
 from portfolio.models import RunLogEntry, Transaction
 from portfolio.parsers.activity_parser import parse_activity_csv
 from portfolio.parsers.holdings_parser import parse_holdings_csv
@@ -34,8 +37,11 @@ from portfolio.sheets.writer import (
     get_gspread_client,
     load_existing_source_files,
     load_existing_transaction_keys,
+    load_recorded_symbols,
+    load_watchlist_symbols,
     write_cash,
     write_holdings,
+    write_price_history,
     write_run_log,
     write_stock_metrics,
     write_transactions,
@@ -231,8 +237,12 @@ def run_update(credentials=None) -> None:
     # --- 15. Write Cash ---
     write_cash(sh, cash_balances)
 
-    # --- 16. Collect held symbols ---
-    symbols = sorted({p.symbol for p in positions if p.symbol})
+    # --- 16. Collect metric symbols: all recorded (held OR sold) ∪ watchlist ---
+    # Read from the Transactions tab AFTER writing this run's rows, so newly added
+    # symbols are included. normalize_all dedups, drops cash/blank, maps BRKB→BRK-B.
+    recorded = load_recorded_symbols(sh)
+    watchlist = load_watchlist_symbols(sh)
+    symbols = normalize_all([*recorded, *watchlist])
 
     # --- 17. Load cache, fetch yfinance fundamentals, save cache ---
     yf_cache = load_yfinance_cache(service, cache_id)
@@ -240,8 +250,15 @@ def run_update(credentials=None) -> None:
     save_yfinance_cache(service, cache_id, yf_cache)
     print(f"Fetched fundamentals for {len(fundamentals)} symbol(s)")
 
-    # --- 18. Write Stock Metrics ---
+    # --- 17b. Load cache, fetch 5-yr weekly closing prices, save cache ---
+    ph_cache = load_price_history_cache(service, cache_id)
+    histories = fetch_price_history(symbols, ph_cache)
+    save_price_history_cache(service, cache_id, ph_cache)
+    print(f"Fetched price history for {len(histories)} symbol(s)")
+
+    # --- 18. Write Stock Metrics + Price History ---
     write_stock_metrics(sh, fundamentals, date.today())
+    write_price_history(sh, histories)
 
     # --- 19. Save updated account_state ---
     save_account_state(service, cache_id, account_state)

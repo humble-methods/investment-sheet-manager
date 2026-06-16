@@ -1,8 +1,9 @@
-"""yfinance wrapper: fetch fundamentals with a Drive-backed JSON cache (TTL).
+"""yfinance wrapper: fetch fundamentals + price history with Drive-backed JSON caches (TTL).
 
-Only fundamental data (P/E, dividend yield, ROE history, net income, book
-value) is fetched here. Prices stay in Google Sheets via GOOGLEFINANCE — Python
-never fetches them.
+Fundamental data (P/E, dividend yield, ROE history, net income, book value) and
+5-year weekly closing-price history are fetched here. The *current* price stays
+in Google Sheets via GOOGLEFINANCE — Python only fetches the historical series,
+not live quotes.
 """
 
 import dataclasses
@@ -34,6 +35,14 @@ class StockFundamentals:
 
 
 _CACHE_FIELDS = tuple(f.name for f in dataclasses.fields(StockFundamentals))
+
+
+@dataclass
+class PriceHistory:
+    symbol: str           # normalized (yfinance) symbol
+    dates: list[str]      # ISO "YYYY-MM-DD", oldest→newest
+    closes: list[float]   # weekly closing prices, parallel to dates
+    fetched_at: str       # ISO datetime string
 
 
 def _ticker(symbol: str):
@@ -136,5 +145,87 @@ def fetch_fundamentals(
             continue
         cache[symbol] = dataclasses.asdict(fundamentals)
         results[symbol] = fundamentals
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Price history (5-year weekly closes)
+# ---------------------------------------------------------------------------
+
+
+def _index_to_iso(ts) -> str:
+    """pandas Timestamp / datetime index label → ISO 'YYYY-MM-DD'."""
+    if hasattr(ts, "date"):
+        return ts.date().isoformat()
+    return str(ts)[:10]
+
+
+def _price_history_from_cache(entry: dict) -> PriceHistory:
+    """Rebuild from a cache dict, tolerating missing keys."""
+    return PriceHistory(
+        symbol=entry.get("symbol", ""),
+        dates=list(entry.get("dates") or []),
+        closes=list(entry.get("closes") or []),
+        fetched_at=entry.get("fetched_at", ""),
+    )
+
+
+def _empty_history(symbol: str) -> PriceHistory:
+    """Empty record for a symbol we couldn't fetch and have no cache for."""
+    return PriceHistory(symbol=symbol, dates=[], closes=[], fetched_at=_now_iso())
+
+
+def _fetch_history_one(symbol: str, period: str, interval: str) -> PriceHistory:
+    """Pull one symbol's closing-price history from yfinance. May raise on network error."""
+    ticker = _ticker(symbol)
+    hist = ticker.history(period=period, interval=interval, auto_adjust=False)
+    dates: list[str] = []
+    closes: list[float] = []
+    if hist is not None and not getattr(hist, "empty", True):
+        for idx, value in hist["Close"].items():
+            if value is None or value != value:  # skip NaN (value != value)
+                continue
+            dates.append(_index_to_iso(idx))
+            closes.append(float(value))
+    return PriceHistory(symbol=symbol, dates=dates, closes=closes, fetched_at=_now_iso())
+
+
+def fetch_price_history(
+    symbols: Iterable[str],
+    cache: dict,
+    ttl_hours: int = CACHE_TTL_HOURS,
+    period: str = "5y",
+    interval: str = "1wk",
+) -> dict[str, PriceHistory]:
+    """5-year weekly closing prices per symbol, cache-first.
+
+    Same control flow as ``fetch_fundamentals``:
+      - fresh cache entry (< ttl_hours old) -> use it, no network call
+      - otherwise fetch from yfinance and refresh the cache entry
+      - on fetch failure -> keep the stale entry if present, else return an empty
+        record (NOT cached, so the next run retries)
+
+    ``cache`` is mutated in place (caller persists it to Drive). Returns
+    ``{symbol: PriceHistory}`` keyed by normalized symbol.
+    """
+    results: dict[str, PriceHistory] = {}
+
+    for symbol in normalize_all(symbols):
+        entry = cache.get(symbol)
+        if entry is not None and _is_fresh(entry, ttl_hours):
+            results[symbol] = _price_history_from_cache(entry)
+            continue
+        try:
+            history = _fetch_history_one(symbol, period, interval)
+        except Exception as exc:  # yfinance raises a wide range of errors
+            logger.warning("yfinance history fetch failed for %s: %s", symbol, exc)
+            results[symbol] = (
+                _price_history_from_cache(entry) if entry is not None
+                else _empty_history(symbol)
+            )
+            continue
+        cache[symbol] = dataclasses.asdict(history)
+        results[symbol] = history
 
     return results
