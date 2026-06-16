@@ -78,7 +78,7 @@ def detect_csv_type(filename: str, filepath: Path | str | None = None) -> str:
     import csv as _csv
 
     name = Path(filename).name
-    if name.startswith("PendingAndSettledActivity"):
+    if name.startswith("PendingAndSettledActivity") or name.startswith("Settled"):
         return "activity"
     if name.startswith("Holdings"):
         return "holdings"

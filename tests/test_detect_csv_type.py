@@ -12,8 +12,12 @@ SAMPLE_DATA = __import__("pathlib").Path(__file__).parent / "sample_data"
 # ---------------------------------------------------------------------------
 
 
-def test_filename_activity():
+def test_filename_activity_pending_and_settled():
     assert detect_csv_type("PendingAndSettledActivity_012026_032026.csv") == "activity"
+
+
+def test_filename_activity_settled():
+    assert detect_csv_type("SettledActivity_012026_032026.csv") == "activity"
 
 
 def test_filename_holdings():

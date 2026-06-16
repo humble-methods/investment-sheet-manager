@@ -90,7 +90,7 @@ The accounts already have positions. We cannot reconstruct full history from act
 All four report types export from Merrill Edge. Numbers use comma-thousands separators and **parentheses for negatives** (e.g., `(3,211.38)` = -3211.38). Dates are `M/D/YYYY`.
 
 ### 1. Activity CSV (Primary Input — Ongoing)
-**Filename pattern:** `PendingAndSettledActivity_MMYYYY_MMYYYY.csv`
+**Filename pattern:** `PendingAndSettledActivity_MMYYYY_MMYYYY.csv` or `Settled_MMYYYY_MMYYYY.csv`
 
 | Column | Notes |
 |--------|-------|
