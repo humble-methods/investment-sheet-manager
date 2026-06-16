@@ -458,7 +458,7 @@ def test_write_holdings_googfinance_formulas():
     assert len(rows) == 1
     row = rows[0]
     # current_price formula references symbol in column D, row 2
-    assert 'GOOGFINANCE(D2,"price")' in row[7]
+    assert 'GOOGLEFINANCE(D2,"price")' in row[7]
     # market_value formula references quantity (E) and price (H)
     assert "E2*H2" in row[8]
 
@@ -572,9 +572,9 @@ def test_write_stock_metrics_googfinance_formulas():
     rows = ws.append_rows.call_args[0][0]
     row = rows[0]
     # AAPL is in row 2, symbol in column B
-    assert 'GOOGFINANCE(B2,"price")' in row[11]   # current_price
-    assert 'GOOGFINANCE(B2,"high52")' in row[12]  # high_52wk
-    assert 'GOOGFINANCE(B2,"low52")' in row[13]   # low_52wk
+    assert 'GOOGLEFINANCE(B2,"price")' in row[11]   # current_price
+    assert 'GOOGLEFINANCE(B2,"high52")' in row[12]  # high_52wk
+    assert 'GOOGLEFINANCE(B2,"low52")' in row[13]   # low_52wk
 
 
 def test_write_stock_metrics_none_fields_written_as_empty():

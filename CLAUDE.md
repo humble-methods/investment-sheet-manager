@@ -263,7 +263,7 @@ Merrill uses standard US ticker symbols for ADRs (`IX`, `TM`, `LYG`, `TSM`, etc.
 | `Transactions` | All normalized transactions (INIT_BUY + activity). One row per event. |
 | `Holdings` | Current position summary per account. Derived by replaying Transactions. |
 | `Cash` | Per-account cash (CMA sweep 990156937 / Roth IIAXX): reconstructed vs snapshot + drift. |
-| `Stock Metrics` | Combined metrics + ROE per ticker. Prices via GOOGFINANCE formulas. |
+| `Stock Metrics` | Combined metrics + ROE per ticker. Prices via GOOGLEFINANCE formulas. |
 | `Run Log` | One row per run: timestamp, files processed, errors, holdings delta, skipped accounts, cash reconciliation. |
 
 **Editable tabs (human-maintained):**
@@ -286,7 +286,7 @@ in Drive `cache/account_state.json`, not the sheet.
 ### Holdings tab
 `as_of_date | account_number | account_registration | symbol | quantity | avg_cost | cost_basis`
 
-Note: Current price and market value are NOT stored here — they're computed live in Google Sheets using GOOGFINANCE formulas in adjacent columns.
+Note: Current price and market value are NOT stored here — they're computed live in Google Sheets using GOOGLEFINANCE formulas in adjacent columns.
 
 ### Cash tab
 `as_of_date | account_number | account_registration | owner | cash_account | reconstructed | snapshot | drift`
@@ -298,11 +298,11 @@ the bootstrap; `snapshot` is from the latest Holdings CSV (blank if none this ru
 Python writes these columns (from yfinance, updated each run):
 `as_of_date | symbol | pe_ratio | dividend_yield | roe_current | roe_1y | roe_2y | roe_3y | roe_4y | net_income | book_value`
 
-Google Sheets GOOGFINANCE formulas live in additional columns (not written by Python):
-- Current price: `=GOOGFINANCE(B2, "price")`
-- 52-week high: `=GOOGFINANCE(B2, "high52")`
-- 52-week low: `=GOOGFINANCE(B2, "low52")`
-- 5-year price history: Written as a separate range using `=GOOGFINANCE(B2, "price", TODAY()-5*365, TODAY(), "WEEKLY")`
+Google Sheets GOOGLEFINANCE formulas live in additional columns (not written by Python):
+- Current price: `=GOOGLEFINANCE(B2, "price")`
+- 52-week high: `=GOOGLEFINANCE(B2, "high52")`
+- 52-week low: `=GOOGLEFINANCE(B2, "low52")`
+- 5-year price history: Written as a separate range using `=GOOGLEFINANCE(B2, "price", TODAY()-5*365, TODAY(), "WEEKLY")`
 
 ### Run Log tab
 `run_timestamp | files_processed | init_rows_added | transactions_added | accounts_skipped | errors | holdings_changed | cash_reconciliation | duration_sec | notes`
@@ -354,9 +354,9 @@ Google Sheets GOOGFINANCE formulas live in additional columns (not written by Py
 - Sells deplete oldest lots first within the same account
 - Holdings recomputed from scratch each run by replaying full transaction history
 
-### Price Data via GOOGFINANCE (Not Python)
+### Price Data via GOOGLEFINANCE (Not Python)
 - Current prices and historical price series are NOT fetched by Python
-- Google Sheets GOOGFINANCE formulas handle all price data — faster, always fresh
+- Google Sheets GOOGLEFINANCE formulas handle all price data — faster, always fresh
 - Python only writes fundamental data (ROE, P/E, dividend yield) from yfinance
 - ROE history: 4 years of annual ROE data written to Stock Metrics tab
 

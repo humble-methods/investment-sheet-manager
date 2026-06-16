@@ -236,7 +236,7 @@ def write_transactions(
 
 
 def write_holdings(sh: gspread.Spreadsheet, positions: list[Position]) -> None:
-    """Overwrite Holdings tab with current positions and GOOGFINANCE price formulas."""
+    """Overwrite Holdings tab with current positions and GOOGLEFINANCE price formulas."""
     ws = _ensure_tab(sh, TAB_HOLDINGS, HOLDINGS_HEADERS)
     ws.clear()
     ws.append_row(HOLDINGS_HEADERS, value_input_option="USER_ENTERED")
@@ -253,7 +253,7 @@ def write_holdings(sh: gspread.Spreadsheet, positions: list[Position]) -> None:
             round(pos.quantity, 8),
             round(pos.avg_cost, 6),
             round(pos.total_cost_basis, 2),
-            f'=IFERROR(GOOGFINANCE(D{row_num},"price"),0)',
+            f'=IFERROR(GOOGLEFINANCE(D{row_num},"price"),0)',
             f'=IFERROR(E{row_num}*H{row_num},0)',
         ])
 
@@ -290,7 +290,7 @@ def write_stock_metrics(
     fundamentals: dict[str, StockFundamentals],
     run_date: date,
 ) -> None:
-    """Overwrite Stock Metrics tab with yfinance fundamentals + GOOGFINANCE formulas."""
+    """Overwrite Stock Metrics tab with yfinance fundamentals + GOOGLEFINANCE formulas."""
     ws = _ensure_tab(sh, TAB_STOCK_METRICS, STOCK_METRICS_HEADERS)
     ws.clear()
     ws.append_row(STOCK_METRICS_HEADERS, value_input_option="USER_ENTERED")
@@ -311,9 +311,9 @@ def write_stock_metrics(
             "" if f.roe_4y is None else f.roe_4y,
             "" if f.net_income is None else f.net_income,
             "" if f.book_value is None else f.book_value,
-            f'=IFERROR(GOOGFINANCE({sym_ref},"price"),"N/A")',
-            f'=IFERROR(GOOGFINANCE({sym_ref},"high52"),"N/A")',
-            f'=IFERROR(GOOGFINANCE({sym_ref},"low52"),"N/A")',
+            f'=IFERROR(GOOGLEFINANCE({sym_ref},"price"),"N/A")',
+            f'=IFERROR(GOOGLEFINANCE({sym_ref},"high52"),"N/A")',
+            f'=IFERROR(GOOGLEFINANCE({sym_ref},"low52"),"N/A")',
         ])
 
     if rows:

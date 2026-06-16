@@ -1,7 +1,7 @@
 """yfinance wrapper: fetch fundamentals with a Drive-backed JSON cache (TTL).
 
 Only fundamental data (P/E, dividend yield, ROE history, net income, book
-value) is fetched here. Prices stay in Google Sheets via GOOGFINANCE — Python
+value) is fetched here. Prices stay in Google Sheets via GOOGLEFINANCE — Python
 never fetches them.
 """
 

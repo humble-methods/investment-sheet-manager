@@ -677,8 +677,8 @@ def write_holdings(
     """
     Overwrite Holdings tab (clear then rewrite).
     Columns: as_of_date | account_number | account_registration | symbol | quantity | avg_cost | cost_basis
-    Note: current_price and market_value columns use GOOGFINANCE formulas —
-    write them as formulas, e.g.: =IFERROR(GOOGFINANCE(D2,"price"),0)
+    Note: current_price and market_value columns use GOOGLEFINANCE formulas —
+    write them as formulas, e.g.: =IFERROR(GOOGLEFINANCE(D2,"price"),0)
     """
 
 def write_cash(
@@ -702,24 +702,24 @@ def write_stock_metrics(
     Overwrite Stock Metrics tab (clear then rewrite).
     Python-written columns: as_of_date | symbol | pe_ratio | dividend_yield |
         roe_current | roe_1y | roe_2y | roe_3y | roe_4y | net_income | book_value
-    Adjacent GOOGFINANCE formula columns (written as formulas by this function):
-        current_price: =IFERROR(GOOGFINANCE(B2,"price"),"N/A")
-        high_52wk:     =IFERROR(GOOGFINANCE(B2,"high52"),"N/A")
-        low_52wk:      =IFERROR(GOOGFINANCE(B2,"low52"),"N/A")
+    Adjacent GOOGLEFINANCE formula columns (written as formulas by this function):
+        current_price: =IFERROR(GOOGLEFINANCE(B2,"price"),"N/A")
+        high_52wk:     =IFERROR(GOOGLEFINANCE(B2,"high52"),"N/A")
+        low_52wk:      =IFERROR(GOOGLEFINANCE(B2,"low52"),"N/A")
     """
 
 def write_run_log(sh: gspread.Spreadsheet, entry: RunLogEntry) -> None:
     """Append one row to Run Log tab."""
 ```
 
-### GOOGFINANCE formula strategy
-Python writes `=IFERROR(GOOGFINANCE(B2,"price"),"N/A")` as a string value into cells. Google Sheets treats strings starting with `=` as formulas. This keeps price data always-fresh without Python making any price API calls.
+### GOOGLEFINANCE formula strategy
+Python writes `=IFERROR(GOOGLEFINANCE(B2,"price"),"N/A")` as a string value into cells. Google Sheets treats strings starting with `=` as formulas. This keeps price data always-fresh without Python making any price API calls.
 
 ### Validation
 - Run writer against a test Sheet
 - Verify tabs created with correct headers
 - Run twice → no duplicate Transactions rows
-- Verify GOOGFINANCE formulas render as prices (not formula text)
+- Verify GOOGLEFINANCE formulas render as prices (not formula text)
 
 ---
 
@@ -865,6 +865,6 @@ Phase 1 (Foundation)
 
 1. Hank or Mom drops Merrill CSV(s) into the shared Drive upload folder
 2. Opens the Colab notebook and clicks Run All
-3. Google Sheet is updated: new Transactions rows, current Holdings, Stock Metrics with GOOGFINANCE prices, Run Log entry
+3. Google Sheet is updated: new Transactions rows, current Holdings, Stock Metrics with GOOGLEFINANCE prices, Run Log entry
 4. CSV moved to processed/ folder
 5. No manual steps beyond (1) downloading the CSV from Merrill and (2) clicking Run All in Colab
