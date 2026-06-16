@@ -65,14 +65,18 @@ def strip_field(value: str) -> str:
     return value.strip()
 
 
-def detect_csv_type(filename: str) -> str:
+def detect_csv_type(filename: str, filepath: Path | str | None = None) -> str:
     """
+    Detect Merrill CSV type by filename first, then by header content as fallback.
+
     "PendingAndSettledActivity_*" -> "activity"
     "Holdings_*"                  -> "holdings"
     "Realized_*"                  -> "realized"
     "Unrealized_*"                -> "unrealized"
-    else                          -> "unknown"
+    else -> sniff headers from filepath (if provided), or "unknown"
     """
+    import csv as _csv
+
     name = Path(filename).name
     if name.startswith("PendingAndSettledActivity"):
         return "activity"
@@ -82,4 +86,21 @@ def detect_csv_type(filename: str) -> str:
         return "realized"
     if name.startswith("Unrealized"):
         return "unrealized"
+
+    if filepath is None:
+        return "unknown"
+
+    try:
+        with open(filepath, newline="", encoding="utf-8-sig") as fh:
+            headers = {h.strip() for h in next(_csv.reader(fh))}
+        if "Trade Date" in headers:
+            return "activity"
+        if "Unit Cost ($)" in headers:
+            return "unrealized"
+        if "Liquidation Date" in headers:
+            return "realized"
+        if "Price ($)" in headers:
+            return "holdings"
+    except Exception:
+        pass
     return "unknown"

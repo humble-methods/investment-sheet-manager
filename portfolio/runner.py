@@ -97,7 +97,7 @@ def run_update(credentials=None) -> None:
             downloaded.append({
                 **f,
                 "path": dest,
-                "type": detect_csv_type(f["name"]),
+                "type": detect_csv_type(f["name"], dest),
                 "failed": False,
             })
         except Exception as exc:
