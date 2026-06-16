@@ -3,7 +3,7 @@
 from datetime import date, datetime
 from pathlib import Path
 
-from portfolio.config import CASH_CUSIPS, CASH_SYMBOLS, SYMBOL_OVERRIDES
+from portfolio.market.symbol_overrides import is_cash, normalize_symbol
 
 # Merrill Description 2 boilerplate: cut from whichever marker appears first.
 DESCRIPTION_MARKERS = ("ACTUAL PRICES, REMUNERATION", "CLIENT ENTERED.")
@@ -38,18 +38,15 @@ def parse_date(value: str) -> date:
 def clean_symbol(raw: str, cusip: str = "") -> str | None:
     """
     Returns normalized yfinance-compatible symbol, or None for cash positions.
-    Applies SYMBOL_OVERRIDES. Returns None if cusip in CASH_CUSIPS or raw in
-    CASH_SYMBOLS/CASH_CUSIPS.
+    Normalization lives in portfolio.market.symbol_overrides (single source of
+    truth); this just adds the parser-side blank/"--" handling.
     """
     raw = raw.strip()
-    cusip = cusip.strip()
-
     if raw in ("", "--"):
         return None
-    if raw in CASH_SYMBOLS or raw in CASH_CUSIPS or cusip in CASH_CUSIPS:
+    if is_cash(raw, cusip):
         return None
-
-    return SYMBOL_OVERRIDES.get(raw, raw)
+    return normalize_symbol(raw)
 
 
 def clean_description(raw: str) -> str:
