@@ -30,6 +30,10 @@ SPREADSHEET_ID: str = os.environ.get("SPREADSHEET_ID", "")
 # yfinance cache TTL
 CACHE_TTL_HOURS: int = 24
 
+# Composition tab: equities whose market weight is below this fraction of their
+# scope collapse into a single "Other" slice. Cash is never bucketed.
+COMPOSITION_OTHER_THRESHOLD: float = 0.015
+
 # Known account roster (informational; account_number is the canonical key).
 # account_registration is NOT unique - multiple accounts share "CMA-Edge".
 # Optional owner labels help the shared (intentionally cross-visible) sheet stay readable.

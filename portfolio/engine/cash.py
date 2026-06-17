@@ -5,6 +5,7 @@ from datetime import date
 from portfolio.config import CASH_MMKT_SYMBOL, CASH_SWEEP_CUSIP
 from portfolio.engine.holdings import filter_and_partition
 from portfolio.models import CashBalance, Transaction
+from portfolio.parsers.utils import parse_date
 
 _DEFAULT_TOLERANCE = 0.01
 
@@ -47,6 +48,32 @@ def reconstruct_cash(
         balances[tx.account_number] = balances.get(tx.account_number, 0.0) - tx.amount
 
     return {account: round(balance, 2) for account, balance in balances.items()}
+
+
+def cash_balance_series(
+    transactions: list[Transaction],
+    bootstrap_cash: dict[str, float],
+    account_state: dict[str, dict],
+) -> dict[str, list[tuple[date, float]]]:
+    """Per-account chronological ``[(date, balance)]`` running cash.
+
+    Same sweep-only model as ``reconstruct_cash`` (Decision 19): the opening point is
+    each bootstrapped account's init_date at its bootstrap balance, then each
+    post-cutoff cash-account row (``symbol is None``) steps the balance by ``-amount``.
+    Feeds the time-weighted average idle cash used for opportunity cost. The final
+    balance of each series matches ``reconstruct_cash`` for the same inputs.
+    """
+    kept, _ = filter_and_partition(transactions, account_state)
+    series: dict[str, list[tuple[date, float]]] = {
+        account: [(parse_date(state["init_date"]), round(bootstrap_cash.get(account, 0.0), 2))]
+        for account, state in account_state.items()
+    }
+    for tx in sorted((t for t in kept if t.symbol is None), key=lambda t: t.trade_date):
+        points = series.get(tx.account_number)
+        if points is None:
+            continue
+        points.append((tx.trade_date, round(points[-1][1] - tx.amount, 2)))
+    return series
 
 
 def reconcile_cash(

@@ -24,6 +24,10 @@ from portfolio.sheets.writer import (
     write_cash,
     write_stock_metrics,
     write_price_history,
+    write_composition,
+    write_performance,
+    write_performance_by_year,
+    write_opportunity_cost,
     write_run_log,
     TAB_TRANSACTIONS,
     TAB_HOLDINGS,
@@ -32,11 +36,19 @@ from portfolio.sheets.writer import (
     TAB_RUN_LOG,
     TAB_WATCHLIST,
     TAB_PRICE_HISTORY,
+    TAB_COMPOSITION,
+    TAB_PERFORMANCE,
+    TAB_PERFORMANCE_BY_YEAR,
+    TAB_OPPORTUNITY_COST,
     TRANSACTIONS_HEADERS,
     HOLDINGS_HEADERS,
     CASH_HEADERS,
     STOCK_METRICS_HEADERS,
     RUN_LOG_HEADERS,
+    COMPOSITION_HEADERS,
+    PERFORMANCE_HEADERS,
+    PERFORMANCE_BY_YEAR_HEADERS,
+    OPPORTUNITY_COST_HEADERS,
 )
 
 
@@ -749,3 +761,158 @@ def test_write_run_log_appends():
     assert row[0] == "2026-01-30T10:00:00"
     assert row[1] == 2
     assert row[8] == 4.2
+
+
+# ---------------------------------------------------------------------------
+# write_composition
+# ---------------------------------------------------------------------------
+
+def _make_comp_row(scope="ALL", symbol="AAPL", mv=2000.0, mw=0.5,
+                   cb=1000.0, cw=0.4, delta=0.1):
+    from portfolio.metrics.composition import CompositionRow
+    return CompositionRow(scope, symbol, mv, mw, cb, cw, delta)
+
+
+def test_write_composition_clears_and_rewrites():
+    sh, ws = _mock_sh_with_tab(TAB_COMPOSITION)
+    write_composition(sh, [_make_comp_row()], date(2026, 6, 15))
+    ws.clear.assert_called_once()
+    ws.append_row.assert_called_once_with(
+        COMPOSITION_HEADERS, value_input_option="USER_ENTERED"
+    )
+    ws.append_rows.assert_called_once()
+
+
+def test_write_composition_row_shape_as_of_date_last():
+    sh, ws = _mock_sh_with_tab(TAB_COMPOSITION)
+    row_in = _make_comp_row(symbol="CASH", mv=500.0, mw=0.125,
+                            cb=500.0, cw=0.2, delta=-0.075)
+    write_composition(sh, [row_in], date(2026, 6, 15))
+    row = ws.append_rows.call_args[0][0][0]
+    assert row[0] == "ALL"           # scope (A)
+    assert row[1] == "CASH"          # symbol (B)
+    assert row[2] == 500.0           # market value (C)
+    assert row[6] == -0.075          # weight delta (G)
+    assert row[7] == "2026-06-15"    # as_of_date last (H)
+    assert len(row) == len(COMPOSITION_HEADERS)
+
+
+def test_write_composition_empty():
+    sh, ws = _mock_sh_with_tab(TAB_COMPOSITION)
+    write_composition(sh, [], date(2026, 6, 15))
+    ws.clear.assert_called_once()
+    ws.append_rows.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# write_performance / write_performance_by_year
+# ---------------------------------------------------------------------------
+
+def _make_symbol_perf(symbol="AAPL", first=date(2024, 1, 2), cur=1500.0, cb=1000.0,
+                      total=0.12, price=0.10, income=0.02):
+    from portfolio.metrics.performance import SymbolPerformance
+    return SymbolPerformance(symbol, first, cur, cb, total, price, income)
+
+
+def test_write_performance_row_shape_as_of_last():
+    sh, ws = _mock_sh_with_tab(TAB_PERFORMANCE)
+    write_performance(sh, [_make_symbol_perf()], date(2026, 6, 16))
+    ws.clear.assert_called_once()
+    ws.append_row.assert_called_once_with(
+        PERFORMANCE_HEADERS, value_input_option="USER_ENTERED"
+    )
+    row = ws.append_rows.call_args[0][0][0]
+    assert row[0] == "AAPL"
+    assert row[1] == "2024-01-02"   # first held (B)
+    assert row[4] == 0.12           # lifetime total xirr (E)
+    assert row[7] == "2026-06-16"   # as_of_date last (H)
+    assert len(row) == len(PERFORMANCE_HEADERS)
+
+
+def test_write_performance_none_returns_blank():
+    sh, ws = _mock_sh_with_tab(TAB_PERFORMANCE)
+    write_performance(
+        sh, [_make_symbol_perf(first=None, total=None, price=None, income=None)],
+        date(2026, 6, 16),
+    )
+    row = ws.append_rows.call_args[0][0][0]
+    assert row[1] == ""   # first_held None
+    assert row[4] == ""   # total xirr None
+    assert row[6] == ""   # income None
+
+
+def test_write_performance_empty():
+    sh, ws = _mock_sh_with_tab(TAB_PERFORMANCE)
+    write_performance(sh, [], date(2026, 6, 16))
+    ws.append_rows.assert_not_called()
+
+
+def test_write_performance_by_year_row_shape():
+    from portfolio.metrics.performance import YearPerformance
+    sh, ws = _mock_sh_with_tab(TAB_PERFORMANCE_BY_YEAR)
+    yp = YearPerformance("AAPL", 2025, 1000.0, 1200.0, 100.0, 30.0, 0.23, 0.20)
+    write_performance_by_year(sh, [yp], date(2026, 6, 16))
+    ws.append_row.assert_called_once_with(
+        PERFORMANCE_BY_YEAR_HEADERS, value_input_option="USER_ENTERED"
+    )
+    row = ws.append_rows.call_args[0][0][0]
+    assert row[0] == "AAPL"
+    assert row[1] == 2025
+    assert row[6] == 0.23           # total return (G)
+    assert row[8] == "2026-06-16"   # as_of_date last (I)
+    assert len(row) == len(PERFORMANCE_BY_YEAR_HEADERS)
+
+
+def test_write_performance_by_year_none_blank():
+    from portfolio.metrics.performance import YearPerformance
+    sh, ws = _mock_sh_with_tab(TAB_PERFORMANCE_BY_YEAR)
+    yp = YearPerformance("AAPL", 2021, 0.0, 0.0, 0.0, 0.0, None, None)
+    write_performance_by_year(sh, [yp], date(2026, 6, 16))
+    row = ws.append_rows.call_args[0][0][0]
+    assert row[6] == ""
+    assert row[7] == ""
+
+
+# ---------------------------------------------------------------------------
+# write_opportunity_cost
+# ---------------------------------------------------------------------------
+
+def _make_opp_row(scope="ALL"):
+    from portfolio.metrics.opportunity import OpportunityCost
+    return OpportunityCost(
+        scope=scope, avg_idle_cash=1000.0, avg_total_value=10000.0, cash_weight=0.1,
+        portfolio_return=0.10, cash_return=0.02, opportunity_cost=80.0, cash_drag=0.008,
+        window_start=date(2025, 1, 1), window_years=1.0, note="n",
+    )
+
+
+def test_write_opportunity_cost_row_shape_as_of_last():
+    sh, ws = _mock_sh_with_tab(TAB_OPPORTUNITY_COST)
+    write_opportunity_cost(sh, [_make_opp_row()], date(2026, 6, 16))
+    ws.clear.assert_called_once()
+    ws.append_row.assert_called_once_with(
+        OPPORTUNITY_COST_HEADERS, value_input_option="USER_ENTERED"
+    )
+    row = ws.append_rows.call_args[0][0][0]
+    assert row[0] == "ALL"
+    assert row[6] == 80.0            # opportunity cost $ (G)
+    assert row[8] == "2025-01-01"    # window start (I)
+    assert row[11] == "2026-06-16"   # as_of_date last (L)
+    assert len(row) == len(OPPORTUNITY_COST_HEADERS)
+
+
+def test_write_opportunity_cost_none_blank():
+    from portfolio.metrics.opportunity import OpportunityCost
+    sh, ws = _mock_sh_with_tab(TAB_OPPORTUNITY_COST)
+    r = OpportunityCost("A", 0.0, 0.0, 0.0, None, None, None, None, None, 0.0, "n")
+    write_opportunity_cost(sh, [r], date(2026, 6, 16))
+    row = ws.append_rows.call_args[0][0][0]
+    assert row[4] == ""   # portfolio_return None
+    assert row[6] == ""   # opportunity cost None
+    assert row[8] == ""   # window_start None
+
+
+def test_write_opportunity_cost_empty():
+    sh, ws = _mock_sh_with_tab(TAB_OPPORTUNITY_COST)
+    write_opportunity_cost(sh, [], date(2026, 6, 16))
+    ws.append_rows.assert_not_called()

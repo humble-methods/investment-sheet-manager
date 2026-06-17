@@ -1,6 +1,11 @@
 from datetime import date
 
-from portfolio.engine.cash import cash_account_for, reconcile_cash, reconstruct_cash
+from portfolio.engine.cash import (
+    cash_account_for,
+    cash_balance_series,
+    reconcile_cash,
+    reconstruct_cash,
+)
 from portfolio.models import Transaction
 
 STATE = {
@@ -65,6 +70,25 @@ def test_pre_cutoff_and_unbootstrapped_rows_excluded():
     balances = reconstruct_cash(txns, {"11A-00003": 0.0}, STATE)
     assert balances["11A-00003"] == 100.0
     assert "99Z-99999" not in balances
+
+
+def test_cash_balance_series_opening_and_steps():
+    txns = [cash_tx("CASH_IN", -100.0), cash_tx("CASH_OUT", 30.0)]
+    series = cash_balance_series(txns, {"11A-00003": 1000.0}, STATE)
+    pts = series["11A-00003"]
+    # opening point at init_date with the bootstrap balance
+    assert pts[0] == (date(2020, 1, 1), 1000.0)
+    # two cash rows step the balance: +100 then -30
+    assert pts[-1][1] == 1000.0 + 100.0 - 30.0
+    # final balance matches reconstruct_cash for the same inputs
+    assert pts[-1][1] == reconstruct_cash(txns, {"11A-00003": 1000.0}, STATE)["11A-00003"]
+
+
+def test_cash_balance_series_equity_rows_excluded():
+    txns = [cash_tx("BUY", -500.0, symbol="CSCO"), cash_tx("CASH_IN", -100.0)]
+    series = cash_balance_series(txns, {"11A-00003": 0.0}, STATE)
+    # only the cash row (symbol None) moves the balance
+    assert series["11A-00003"][-1][1] == 100.0
 
 
 def test_reconcile_drift_none_without_snapshot():

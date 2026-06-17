@@ -279,6 +279,10 @@ Merrill uses standard US ticker symbols for ADRs (`IX`, `TM`, `LYG`, `TSM`, etc.
 | `Cash` | Per-account cash (CMA sweep 990156937 / Roth IIAXX): reconstructed vs snapshot + drift. |
 | `Stock Metrics` | Fundamentals + ROE per ticker for **every recorded symbol (held or since sold) + Watchlist**. Current price via GOOGLEFINANCE; fundamentals via yfinance. |
 | `Price History` | 5-year weekly closing prices (yfinance, Python-fetched values). One column per symbol on a shared `Date` axis. |
+| `Composition` | Market-value weight vs cost-basis weight (+ delta) per symbol, cash as its own slice; consolidated (`ALL`) + per-account. Data-only — insert a pie chart once. |
+| `Performance` | Lifetime annualized money-weighted return (XIRR) per symbol — total (dividends in) + price (out) + income contribution — plus a pooled `PORTFOLIO` row. |
+| `Performance By Year` | Per-(symbol, year) calendar-year return (non-annualized Modified Dietz), total + price. Long format for charting. |
+| `Opportunity Cost` | Idle-cash drag vs the portfolio return (dollars left on the table + bps haircut), consolidated + per-account. Nice-to-have; inherits the sweep cash model (Decision 19). |
 | `Run Log` | One row per run: timestamp, files processed, errors, holdings delta, skipped accounts, cash reconciliation. |
 
 **Editable tabs (human-maintained):**
@@ -326,6 +330,44 @@ Covers **every recorded symbol (held or sold) + Watchlist**. Python writes (from
 5-year **weekly closing prices** fetched by Python/yfinance and written as **values** (not formulas):
 `Date | <symbol 1> | <symbol 2> | …` — one row per weekly date on a unified, sorted `Date` axis (the
 union of all symbols' dates; blank where a symbol lacks that week). Symbols sorted alphabetically.
+
+### Composition tab
+`Scope | Symbol | Market Value | Market Weight | Cost Basis | Cost Weight | Weight Delta | As Of Date`
+
+One block per `Scope` (`ALL` consolidated first, then each account number). `Symbol` is a ticker,
+`Other` (sub-threshold equities, `COMPOSITION_OTHER_THRESHOLD` = 1.5%), or `CASH` (never bucketed).
+**Market values use the latest weekly close from Price History (Python), NOT the live GOOGLEFINANCE
+price** — so they can be up to ~1 week stale; the live view stays on Holdings. Weights are fractions
+(0..1); `Weight Delta = Market Weight − Cost Weight`. Symbol (col B) sits beside Market Value (col C)
+so a pie chart selects label+value in one contiguous range.
+
+### Performance tab
+`Symbol | First Held | Current Value | Cost Basis | Lifetime Total XIRR | Lifetime Price XIRR | Income Contribution | As Of Date`
+
+One row per held symbol + a `PORTFOLIO` row. **Lifetime returns are annualized money-weighted XIRR**
+(total = dividends + ADR fees + foreign withholding included; price = excluded; `Income Contribution =
+Total − Price`). Terminal value uses the latest weekly close (Python). The `PORTFOLIO` row pools every
+symbol's flows + total current value — it is the **invested-sleeve** return, NOT a cash-inclusive
+whole-account IRR (external contributions are indistinguishable from sweeps, Decision 19). Returns are
+fractions (0..1).
+
+### Performance By Year tab
+`Symbol | Year | Begin Value | End Value | Net Flows | Dividends | Total Return | Price Return | As Of Date`
+
+One row per (symbol, year). **Per-year returns are non-annualized Modified Dietz** (NOT XIRR — avoids
+inflating partial-year holdings). A year is emitted only where the price history covers it. Begin/End
+values = year-boundary shares (`positions_as_of`) × year-end weekly close. Caveat: dividends exist only
+from each account's bootstrap cutoff forward, so total return slightly understates income for long-held
+bootstrapped lots.
+
+### Opportunity Cost tab
+`Scope | Avg Idle Cash | Avg Total Value | Cash Weight | Portfolio Return | Cash Return | Opportunity Cost ($) | Cash Drag | Window Start | Window Years | Note | As Of Date`
+
+Nice-to-have. One row per `Scope` (`ALL` + each account). Idle cash = time-weighted average reconstructed
+balance over [init_date, today]; `Portfolio Return` = the invested-sleeve PORTFOLIO XIRR; `Cash Return` =
+Bank Interest / avg cash, annualized. `Opportunity Cost ($) = avg idle cash × (portfolio − cash return) ×
+years`; `Cash Drag = Cash Weight × (portfolio − cash return)`. **Dollar figures inherit the unvalidated
+sweep cash model (Decision 19)** and a Bank-Interest-only cash yield — see the `Note` column.
 
 ### Run Log tab
 `Run Timestamp | Files Processed | Init Rows Added | Transactions Added | Accounts Skipped | Errors | Holdings Changed | Cash Reconciliation | Duration (Sec) | Notes`
@@ -382,6 +424,19 @@ union of all symbols' dates; blank where a symbol lacks that week). Symbols sort
 - **5-year weekly closing history:** fetched by Python/yfinance into the `Price History` tab. A date-ranged series is a 2-D spill that can't fit a one-row-per-symbol tab, and the closes are wanted as values.
 - The 52-week high/low GOOGLEFINANCE columns were **removed** in favor of the full history.
 - Python also writes fundamentals (ROE, P/E, dividend yield, net income, book value); ROE history = 4 years.
+
+### Performance: money-weighted returns (XIRR lifetime + Modified Dietz per-year)
+- **Lifetime = annualized XIRR** (money-weighted): every BUY/INIT_BUY/SELL at its date + dividends
+  (total flavor) + terminal current value. Comparable across symbols and holding periods.
+- **Per-year = non-annualized Modified Dietz** (`Performance By Year`): a calendar-year period return
+  that handles mid-year flows without the partial-year annualization blow-up XIRR would cause.
+- **Two flavors:** total (dividends + ADR fees + withholding in) and price (out); difference = income.
+- **PORTFOLIO row** = pooled invested-sleeve XIRR (all equity flows + total terminal value), NOT a
+  whole-account return — external contributions can't be separated from sweeps (Decision 19).
+- **Reuses** the same filtered transaction set as Holdings (`filter_and_partition`) so nothing is
+  double-counted; `positions_as_of` replays FIFO to a date for year-boundary share counts.
+- **Caveats:** per-year coverage is bounded by the 5-yr price-history window; pre-cutoff dividends are
+  absent, so total return understates income for long-held bootstrapped lots.
 
 ### yfinance Caching
 - **Two** Drive caches, each keyed by normalized ticker, 24hr TTL, keep-stale-on-failure:

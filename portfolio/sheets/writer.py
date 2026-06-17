@@ -11,6 +11,9 @@ from portfolio.models import CashBalance, Position, RunLogEntry, Transaction
 
 if TYPE_CHECKING:
     from portfolio.market.yfinance_client import PriceHistory, StockFundamentals
+    from portfolio.metrics.composition import CompositionRow
+    from portfolio.metrics.opportunity import OpportunityCost
+    from portfolio.metrics.performance import SymbolPerformance, YearPerformance
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +29,10 @@ TAB_STOCK_METRICS = "Stock Metrics"
 TAB_RUN_LOG = "Run Log"
 TAB_WATCHLIST = "Watchlist"
 TAB_PRICE_HISTORY = "Price History"
+TAB_COMPOSITION = "Composition"
+TAB_PERFORMANCE = "Performance"
+TAB_PERFORMANCE_BY_YEAR = "Performance By Year"
+TAB_OPPORTUNITY_COST = "Opportunity Cost"
 
 # Displayed header labels are Title Case (human-readable) and decoupled from the
 # internal field keys used for dedup read-back. Only the Transactions tab is ever
@@ -68,6 +75,28 @@ RUN_LOG_HEADERS = [
 ]
 # Human-maintained intake tab: one ticker per row under "Symbol".
 WATCHLIST_HEADERS = ["Symbol"]
+# Composition tab: Symbol (col B) sits next to Market Value (col C) so a pie chart
+# selects label+value in one contiguous range. as_of_date is last (Phase 9 convention).
+COMPOSITION_HEADERS = [
+    "Scope", "Symbol", "Market Value", "Market Weight",
+    "Cost Basis", "Cost Weight", "Weight Delta", "As Of Date",
+]
+# Performance: one row per symbol + a PORTFOLIO row. Returns are fractions (0..1).
+PERFORMANCE_HEADERS = [
+    "Symbol", "First Held", "Current Value", "Cost Basis",
+    "Lifetime Total XIRR", "Lifetime Price XIRR", "Income Contribution", "As Of Date",
+]
+# Per-year (long format): one row per (symbol, year). Returns are fractions (0..1).
+PERFORMANCE_BY_YEAR_HEADERS = [
+    "Symbol", "Year", "Begin Value", "End Value", "Net Flows", "Dividends",
+    "Total Return", "Price Return", "As Of Date",
+]
+# Opportunity cost of idle cash (nice-to-have). Returns/drag are fractions (0..1).
+OPPORTUNITY_COST_HEADERS = [
+    "Scope", "Avg Idle Cash", "Avg Total Value", "Cash Weight", "Portfolio Return",
+    "Cash Return", "Opportunity Cost ($)", "Cash Drag", "Window Start",
+    "Window Years", "Note", "As Of Date",
+]
 
 
 def get_gspread_client(credentials=None):
@@ -438,6 +467,134 @@ def write_price_history(
 
     if rows:
         ws.append_rows(rows, value_input_option="RAW")
+
+
+def write_composition(
+    sh: gspread.Spreadsheet,
+    rows: list[CompositionRow],
+    run_date: date,
+) -> None:
+    """Overwrite the Composition tab with per-scope market vs cost weights.
+
+    Consolidated ("ALL") rows come first (contiguous for a single-range pie chart),
+    then one block per account. Weights are fractions (0..1) — format as % in Sheets.
+    """
+    ws = _ensure_tab(sh, TAB_COMPOSITION, COMPOSITION_HEADERS)
+    ws.clear()
+    ws.append_row(COMPOSITION_HEADERS, value_input_option="USER_ENTERED")
+
+    today = run_date.isoformat()
+    out = []
+    for r in rows:
+        out.append([
+            r.scope,                    # A
+            r.symbol,                   # B
+            round(r.market_value, 2),   # C
+            round(r.market_weight, 6),  # D
+            round(r.cost_basis, 2),     # E
+            round(r.cost_weight, 6),    # F
+            round(r.weight_delta, 6),   # G
+            today,                      # H as_of_date
+        ])
+
+    if out:
+        ws.append_rows(out, value_input_option="RAW")
+
+
+def write_performance(
+    sh: gspread.Spreadsheet,
+    summaries: list[SymbolPerformance],
+    run_date: date,
+) -> None:
+    """Overwrite the Performance tab: lifetime annualized XIRR (total + price) per
+    symbol plus a pooled PORTFOLIO row. Returns are fractions (0..1) — format as %.
+    """
+    ws = _ensure_tab(sh, TAB_PERFORMANCE, PERFORMANCE_HEADERS)
+    ws.clear()
+    ws.append_row(PERFORMANCE_HEADERS, value_input_option="USER_ENTERED")
+
+    today = run_date.isoformat()
+    out = []
+    for s in summaries:
+        out.append([
+            s.symbol,                                                                  # A
+            "" if s.first_held is None else s.first_held.isoformat(),                  # B
+            round(s.current_value, 2),                                                 # C
+            round(s.cost_basis, 2),                                                    # D
+            "" if s.lifetime_total_xirr is None else round(s.lifetime_total_xirr, 6),  # E
+            "" if s.lifetime_price_xirr is None else round(s.lifetime_price_xirr, 6),  # F
+            "" if s.income_contribution is None else round(s.income_contribution, 6),  # G
+            today,                                                                     # H
+        ])
+
+    if out:
+        ws.append_rows(out, value_input_option="RAW")
+
+
+def write_performance_by_year(
+    sh: gspread.Spreadsheet,
+    yearly: list[YearPerformance],
+    run_date: date,
+) -> None:
+    """Overwrite the Performance By Year tab: one row per (symbol, year) with
+    non-annualized Modified Dietz total + price returns. Returns are fractions.
+    """
+    ws = _ensure_tab(sh, TAB_PERFORMANCE_BY_YEAR, PERFORMANCE_BY_YEAR_HEADERS)
+    ws.clear()
+    ws.append_row(PERFORMANCE_BY_YEAR_HEADERS, value_input_option="USER_ENTERED")
+
+    today = run_date.isoformat()
+    out = []
+    for y in yearly:
+        out.append([
+            y.symbol,                                                    # A
+            y.year,                                                      # B
+            round(y.begin_value, 2),                                     # C
+            round(y.end_value, 2),                                       # D
+            round(y.net_flows, 2),                                       # E
+            round(y.dividends, 2),                                       # F
+            "" if y.total_return is None else round(y.total_return, 6),  # G
+            "" if y.price_return is None else round(y.price_return, 6),  # H
+            today,                                                       # I
+        ])
+
+    if out:
+        ws.append_rows(out, value_input_option="RAW")
+
+
+def write_opportunity_cost(
+    sh: gspread.Spreadsheet,
+    rows: list[OpportunityCost],
+    run_date: date,
+) -> None:
+    """Overwrite the Opportunity Cost tab: idle-cash drag vs the portfolio return,
+    consolidated (ALL) + per-account. Dollar figures inherit the sweep cash model
+    (Decision 19) — see the Note column. Returns/drag are fractions (0..1).
+    """
+    ws = _ensure_tab(sh, TAB_OPPORTUNITY_COST, OPPORTUNITY_COST_HEADERS)
+    ws.clear()
+    ws.append_row(OPPORTUNITY_COST_HEADERS, value_input_option="USER_ENTERED")
+
+    today = run_date.isoformat()
+    out = []
+    for r in rows:
+        out.append([
+            r.scope,                                                             # A
+            round(r.avg_idle_cash, 2),                                           # B
+            round(r.avg_total_value, 2),                                         # C
+            round(r.cash_weight, 6),                                             # D
+            "" if r.portfolio_return is None else round(r.portfolio_return, 6),  # E
+            "" if r.cash_return is None else round(r.cash_return, 6),            # F
+            "" if r.opportunity_cost is None else round(r.opportunity_cost, 2),  # G
+            "" if r.cash_drag is None else round(r.cash_drag, 6),                # H
+            "" if r.window_start is None else r.window_start.isoformat(),        # I
+            round(r.window_years, 2),                                            # J
+            r.note,                                                              # K
+            today,                                                              # L
+        ])
+
+    if out:
+        ws.append_rows(out, value_input_option="RAW")
 
 
 def write_run_log(sh: gspread.Spreadsheet, entry: RunLogEntry) -> None:

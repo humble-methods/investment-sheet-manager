@@ -951,6 +951,84 @@ python3 -m pytest -q   # full suite green
 
 ---
 
+## Phase 12 — Composition Tab (current value weight)
+**Goal:** A per-symbol snapshot of market-value weight vs cost-basis weight (+ delta), cash as its own slice, consolidated + per-account, as a data table the user charts once.
+
+### Deliverables
+- `portfolio/metrics/composition.py` (`composition_rows`, `CompositionRow`)
+- `portfolio/sheets/writer.py` (`write_composition`, `TAB_COMPOSITION`, `COMPOSITION_HEADERS`)
+- `portfolio/config.py` (`COMPOSITION_OTHER_THRESHOLD = 0.015`)
+- `portfolio/runner.py` (step 18b)
+- `tests/test_composition.py`, `tests/test_writer.py`
+
+### Approach
+- Pure `composition_rows(positions, latest_close, cash_balances, threshold)` → rows per scope (`ALL` first, then each account). `market_value = qty × latest_close` (latest close from the run's `PriceHistory`); cost from `Position.total_cost_basis`; cash slice = reconstructed balance.
+- Equities below `COMPOSITION_OTHER_THRESHOLD` of scope market weight collapse into `Other`; **cash is never bucketed**. Weights are fractions; `Weight Delta = Market Weight − Cost Weight`.
+- Headers Title Case, **`As Of Date` last** (Phase 9 convention). Symbol (col B) beside Market Value (col C) for one-range pie selection.
+
+### Tests
+Weights sum to 1 per scope; `Other` bucketing; cash slice present + unbucketed; delta = market − cost; consolidated vs per-account; missing-price → 0 market value (no crash).
+
+### Validation
+```bash
+python3 -m pytest tests/test_composition.py tests/test_writer.py -q
+```
+
+---
+
+## Phase 13 — Performance Tab (lifetime XIRR + per-year Modified Dietz)
+**Goal:** Annualized money-weighted return per symbol (lifetime) + per-calendar-year returns, each total (dividends in) and price (out), comparable across symbols and entry years.
+
+### Deliverables
+- `portfolio/metrics/performance.py` (`xirr`, `modified_dietz`, `lifetime_cashflows`, `year_returns`, `build_performance`, `SymbolPerformance`, `YearPerformance`)
+- `portfolio/engine/holdings.py` (`positions_as_of` — reuses `filter_and_partition` + `build_lots`)
+- `portfolio/sheets/writer.py` (`write_performance`, `write_performance_by_year` + tabs/headers)
+- `portfolio/runner.py` (step 18c), `tests/test_performance.py`, `tests/test_holdings.py`, `tests/test_writer.py`
+
+### Approach
+- **Lifetime = annualized XIRR** (Newton + bisection fallback, no scipy): buys/sells at `tx.amount`, dividends (total only), terminal = current value. **Per-year = non-annualized Modified Dietz** (avoids partial-year annualization blow-up). `Income = total − price`.
+- Per symbol consolidated across accounts + a pooled `PORTFOLIO` row (invested-sleeve XIRR; not whole-account — sidesteps Decision 19). Total leg nets ADR fees + foreign withholding.
+- Per-year begin/end values = year-boundary shares (`positions_as_of(Dec 31)`) × year-end weekly close from `PriceHistory`; reuses the **same filtered txn set** as Holdings (no double counting).
+
+### Tests
+`xirr` known IRRs + sign edge cases → None; `modified_dietz` closed-form + time-weighting; `lifetime_cashflows` total vs price (fee netting); `year_returns` extraction; `positions_as_of` mid-year buy/sell at a year boundary; `build_performance` integration (chained year values, PORTFOLIO row).
+
+### Validation
+```bash
+python3 -m pytest tests/test_performance.py tests/test_holdings.py -q   # yfinance monkeypatched, never live
+```
+
+### Caveats (in tab notes / docs)
+Per-year coverage is bounded by the 5-yr price-history window; pre-cutoff dividends are absent so total return understates income for long-held bootstrapped lots; terminal/current price is the latest weekly close (≤ ~1 wk stale).
+
+---
+
+## Phase 14 — Opportunity Cost of Idle Cash (nice-to-have)
+**Goal:** Quantify the cost of holding idle cash vs the portfolio's own return — dollars left on the table + the bps haircut to blended return. Depends on Phase 13.
+
+### Deliverables
+- `portfolio/engine/cash.py` (`cash_balance_series` — new; `reconstruct_cash` untouched)
+- `portfolio/metrics/opportunity.py` (`time_weighted_average`, `build_opportunity`, `OpportunityCost`)
+- `portfolio/sheets/writer.py` (`write_opportunity_cost` + tab/headers)
+- `portfolio/runner.py` (step 18d), `tests/test_opportunity.py`, `tests/test_cash.py`, `tests/test_writer.py`
+
+### Approach
+- `cash_balance_series` replays the sweep model into per-account `[(date, balance)]`; `time_weighted_average` → avg idle cash over `[init_date, today]`.
+- `r_inv` = PORTFOLIO lifetime total XIRR (Phase 13); `r_cash` = Bank Interest / avg cash, annualized. `Opportunity Cost ($) = avg idle cash × (r_inv − r_cash) × years`; `Cash Drag = cash_weight × (r_inv − r_cash)`. Consolidated (`ALL`) + per-account.
+
+### Tests
+`time_weighted_average` constant / step / zero-window; `cash_balance_series` opening + steps, equity rows excluded, matches `reconstruct_cash`; `build_opportunity` cost/drag signs, ALL aggregation, None-portfolio-return blanks.
+
+### Validation
+```bash
+python3 -m pytest tests/test_opportunity.py tests/test_cash.py -q
+```
+
+### Caveat
+Dollar figures inherit the unvalidated sweep cash model (Decision 19) + a Bank-Interest-only cash yield — surfaced in the `Note` column.
+
+---
+
 ## Phase Sequence & Dependencies
 
 ```
@@ -968,6 +1046,9 @@ Post-MVP enhancements (sequence by dependency, not number):
 Phase 9 (Human headers, dedup-safe reads)
     └── Phase 10 (Metrics scope + Watchlist)  ← uses Phase 9's TRANSACTIONS_KEYS reads
             └── Phase 11 (5-yr Price History)  ← consumes Phase 10's symbol set
+                    ├── Phase 12 (Composition)          ← + holdings + cash
+                    └── Phase 13 (Performance)          ← + FIFO as-of + transactions
+                            └── Phase 14 (Opportunity Cost)  ← nice-to-have; + cash series
 Phase 8 (Hardening) is orthogonal — do it before or after 9–11.
 ```
 
