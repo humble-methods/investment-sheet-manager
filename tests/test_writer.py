@@ -24,6 +24,9 @@ from portfolio.sheets.writer import (
     write_cash,
     write_stock_metrics,
     write_price_history,
+    write_performance,
+    write_performance_by_year,
+    write_performance_compare,
     write_run_log,
     TAB_TRANSACTIONS,
     TAB_HOLDINGS,
@@ -32,11 +35,19 @@ from portfolio.sheets.writer import (
     TAB_RUN_LOG,
     TAB_WATCHLIST,
     TAB_PRICE_HISTORY,
+    TAB_PERFORMANCE,
+    TAB_PERFORMANCE_BY_YEAR,
+    TAB_PERFORMANCE_COMPARE,
     TRANSACTIONS_HEADERS,
     HOLDINGS_HEADERS,
     CASH_HEADERS,
     STOCK_METRICS_HEADERS,
     RUN_LOG_HEADERS,
+    PRICE_HISTORY_HEADERS,
+    PERFORMANCE_HEADERS,
+    PERFORMANCE_BY_YEAR_HEADERS,
+    PERFORMANCE_COMPARE_SLOTS,
+    PERFORMANCE_COMPARE_YEARS,
 )
 
 
@@ -632,7 +643,8 @@ def _make_fundamentals():
     return {
         "AAPL": StockFundamentals(
             symbol="AAPL", pe_ratio=28.4, dividend_yield=0.0055,
-            roe_current=1.47, roe_1y=1.60, roe_2y=1.55, roe_3y=1.45, roe_4y=1.30,
+            roe_current=1.47,
+            roe_by_year={"2025": 1.60, "2024": 1.55, "2023": 1.45, "2022": 1.30},
             net_income=94_000_000_000, book_value=64_000_000_000,
             fetched_at="2026-01-30T10:00:00",
         ),
@@ -655,12 +667,28 @@ def test_write_stock_metrics_googfinance_formulas():
     write_stock_metrics(sh, _make_fundamentals(), date(2026, 1, 30))
     rows = ws.append_rows.call_args[0][0]
     row = rows[0]
-    # AAPL is in row 2, symbol now in column A; current_price (col K) references it
-    assert 'GOOGLEFINANCE(A2,"price")' in row[10]   # current_price
-    assert row[11] == "2026-01-30"  # as_of_date moved to last column (L)
+    # AAPL is in row 2, symbol in column A; current_price (col Q, idx 16) references it
+    assert 'GOOGLEFINANCE(A2,"price")' in row[16]   # current_price
+    assert row[17] == "2026-01-30"  # as_of_date is the last column (R)
     # 52-week high/low GOOGLEFINANCE columns are gone
     assert len(row) == len(STOCK_METRICS_HEADERS)
     assert not any("high52" in str(c) or "low52" in str(c) for c in row)
+
+
+def test_write_stock_metrics_roe_relative_year_columns():
+    sh, ws = _metrics_sh()
+    write_stock_metrics(sh, _make_fundamentals(), date(2026, 1, 30))
+    row = ws.append_rows.call_args[0][0][0]
+    # Columns E..N = ROE 1Y..10Y Ago; run year 2026 → 1Y Ago == fiscal 2025, etc.
+    assert row[4] == 1.60   # 1Y Ago  (2025)
+    assert row[5] == 1.55   # 2Y Ago  (2024)
+    assert row[6] == 1.45   # 3Y Ago  (2023)
+    assert row[7] == 1.30   # 4Y Ago  (2022)
+    # 5Y..10Y Ago (2021..2016) have no data yet → blank, ready to fill over time
+    for i in range(8, 14):
+        assert row[i] == "", f"index {i} (>=5Y Ago) should be blank"
+    # 10 ROE-year columns are provisioned
+    assert sum(1 for h in STOCK_METRICS_HEADERS if h.startswith("ROE (") and "Ago" in h) == 10
 
 
 def test_write_stock_metrics_no_52wk_columns():
@@ -676,7 +704,7 @@ def test_write_stock_metrics_none_fields_written_as_empty():
     fundamentals = {
         "IX": StockFundamentals(
             symbol="IX", pe_ratio=None, dividend_yield=None,
-            roe_current=None, roe_1y=None, roe_2y=None, roe_3y=None, roe_4y=None,
+            roe_current=None, roe_by_year={},
             net_income=None, book_value=None, fetched_at="2026-01-30T10:00:00",
         )
     }
@@ -684,8 +712,8 @@ def test_write_stock_metrics_none_fields_written_as_empty():
     rows = ws.append_rows.call_args[0][0]
     row = rows[0]
     assert row[0] == "IX"  # symbol now column A
-    # pe_ratio through book_value (indices 1-9) should all be ""
-    for i in range(1, 10):
+    # pe_ratio through book_value (indices 1-15) should all be ""
+    for i in range(1, 16):
         assert row[i] == "", f"index {i} should be empty"
 
 
@@ -695,33 +723,40 @@ def test_write_stock_metrics_none_fields_written_as_empty():
 
 def _make_histories():
     from portfolio.market.yfinance_client import PriceHistory
+    # yearly close points so anniversary lookups land deterministically
     return {
-        "AAPL": PriceHistory("AAPL", ["2026-01-05", "2026-01-12"], [100.0, 105.0], "x"),
-        # disjoint + overlapping dates vs AAPL
-        "MSFT": PriceHistory("MSFT", ["2026-01-12", "2026-01-19"], [200.0, 210.0], "x"),
+        "AAPL": PriceHistory(
+            "AAPL",
+            ["2021-01-01", "2022-01-01", "2023-01-01",
+             "2024-01-01", "2025-01-01", "2026-01-01"],
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "x",
+        ),
+        # only the two most recent years → older anniversaries fall off as blanks
+        "MSFT": PriceHistory("MSFT", ["2025-01-01", "2026-01-01"], [50.0, 60.0], "x"),
     }
 
 
-def test_write_price_history_unified_date_axis():
+def test_write_price_history_anniversary_rows_per_symbol():
     sh, ws = _mock_sh_with_tab(TAB_PRICE_HISTORY)
-    write_price_history(sh, _make_histories())
+    write_price_history(sh, _make_histories(), today=date(2026, 6, 15))
     ws.clear.assert_called_once()
-    # header: Date + symbols sorted alphabetically
-    assert ws.append_row.call_args[0][0] == ["Date", "AAPL", "MSFT"]
+    # header: Symbol + anniversary columns (Today … 5Y Ago)
+    assert ws.append_row.call_args[0][0] == PRICE_HISTORY_HEADERS
     rows = ws.append_rows.call_args[0][0]
-    # unified, sorted date axis = union of both symbols' dates
-    assert [r[0] for r in rows] == ["2026-01-05", "2026-01-12", "2026-01-19"]
-    # alignment with blanks where a symbol lacks that date
-    assert rows[0] == ["2026-01-05", 100.0, ""]      # MSFT missing this date
-    assert rows[1] == ["2026-01-12", 105.0, 200.0]   # both present
-    assert rows[2] == ["2026-01-19", "", 210.0]      # AAPL missing this date
+    # one row per symbol, sorted alphabetically
+    assert [r[0] for r in rows] == ["AAPL", "MSFT"]
+    # close-on-or-before each anniversary: Today=2026-06-15 → 2026-01-01 close, etc.
+    assert rows[0] == ["AAPL", 6.0, 5.0, 4.0, 3.0, 2.0, 1.0]
+    # MSFT only has 2025/2026 → 2Y..5Y Ago are blank
+    assert rows[1] == ["MSFT", 60.0, 50.0, "", "", "", ""]
 
 
 def test_write_price_history_empty():
     sh, ws = _mock_sh_with_tab(TAB_PRICE_HISTORY)
-    write_price_history(sh, {})
+    write_price_history(sh, {}, today=date(2026, 6, 15))
     ws.clear.assert_called_once()
-    assert ws.append_row.call_args[0][0] == ["Date"]  # header only
+    assert ws.append_row.call_args[0][0] == PRICE_HISTORY_HEADERS  # header only
     ws.append_rows.assert_not_called()
 
 
@@ -749,3 +784,134 @@ def test_write_run_log_appends():
     assert row[0] == "2026-01-30T10:00:00"
     assert row[1] == 2
     assert row[8] == 4.2
+
+
+# ---------------------------------------------------------------------------
+# write_performance / write_performance_by_year
+# ---------------------------------------------------------------------------
+
+def _make_symbol_perf(symbol="AAPL", first=date(2024, 1, 2), cur=1500.0, cb=1000.0,
+                      total=0.12, price=0.10, income=0.02):
+    from portfolio.metrics.performance import SymbolPerformance
+    return SymbolPerformance(symbol, first, cur, cb, total, price, income)
+
+
+def test_write_performance_row_shape_as_of_last():
+    sh, ws = _mock_sh_with_tab(TAB_PERFORMANCE)
+    write_performance(sh, [_make_symbol_perf()], date(2026, 6, 16))
+    ws.clear.assert_called_once()
+    ws.append_row.assert_called_once_with(
+        PERFORMANCE_HEADERS, value_input_option="USER_ENTERED"
+    )
+    row = ws.append_rows.call_args[0][0][0]
+    assert row[0] == "AAPL"
+    assert row[1] == "2024-01-02"   # first held (B)
+    assert row[4] == 0.12           # lifetime total xirr (E)
+    assert row[7] == "2026-06-16"   # as_of_date last (H)
+    assert len(row) == len(PERFORMANCE_HEADERS)
+
+
+def test_write_performance_none_returns_blank():
+    sh, ws = _mock_sh_with_tab(TAB_PERFORMANCE)
+    write_performance(
+        sh, [_make_symbol_perf(first=None, total=None, price=None, income=None)],
+        date(2026, 6, 16),
+    )
+    row = ws.append_rows.call_args[0][0][0]
+    assert row[1] == ""   # first_held None
+    assert row[4] == ""   # total xirr None
+    assert row[6] == ""   # income None
+
+
+def test_write_performance_empty():
+    sh, ws = _mock_sh_with_tab(TAB_PERFORMANCE)
+    write_performance(sh, [], date(2026, 6, 16))
+    ws.append_rows.assert_not_called()
+
+
+def test_write_performance_by_year_row_shape():
+    from portfolio.metrics.performance import YearPerformance
+    sh, ws = _mock_sh_with_tab(TAB_PERFORMANCE_BY_YEAR)
+    yp = YearPerformance("AAPL", 2025, 1000.0, 1200.0, 100.0, 30.0, 0.23, 0.20)
+    write_performance_by_year(sh, [yp], date(2026, 6, 16))
+    ws.append_row.assert_called_once_with(
+        PERFORMANCE_BY_YEAR_HEADERS, value_input_option="USER_ENTERED"
+    )
+    row = ws.append_rows.call_args[0][0][0]
+    assert row[0] == "AAPL"
+    assert row[1] == 2025
+    assert row[6] == 0.23           # total return (G)
+    assert row[8] == "2026-06-16"   # as_of_date last (I)
+    assert len(row) == len(PERFORMANCE_BY_YEAR_HEADERS)
+
+
+def test_write_performance_by_year_none_blank():
+    from portfolio.metrics.performance import YearPerformance
+    sh, ws = _mock_sh_with_tab(TAB_PERFORMANCE_BY_YEAR)
+    yp = YearPerformance("AAPL", 2021, 0.0, 0.0, 0.0, 0.0, None, None)
+    write_performance_by_year(sh, [yp], date(2026, 6, 16))
+    row = ws.append_rows.call_args[0][0][0]
+    assert row[6] == ""
+    assert row[7] == ""
+
+
+# ---------------------------------------------------------------------------
+# write_performance_compare (set-up-once interactive tab)
+# ---------------------------------------------------------------------------
+
+def _mock_sh_without_tab(tab_name=TAB_PERFORMANCE_COMPARE):
+    """sh whose worksheets() lacks ``tab_name``; add_worksheet returns a fresh ws."""
+    other = MagicMock()
+    other.title = TAB_PERFORMANCE
+    new_ws = MagicMock()
+    new_ws.title = tab_name
+    sh = MagicMock()
+    sh.worksheets.return_value = [other]
+    sh.add_worksheet.return_value = new_ws
+    return sh, new_ws
+
+
+def test_write_performance_compare_scaffolds_when_absent():
+    sh, ws = _mock_sh_without_tab()
+    write_performance_compare(sh)
+    sh.add_worksheet.assert_called_once()
+    # grid written as one USER_ENTERED block anchored at A1
+    _, kwargs = ws.update.call_args
+    assert kwargs["range_name"] == "A1"
+    assert kwargs["value_input_option"] == "USER_ENTERED"
+    grid = kwargs["values"]
+    # row 1 = label + N blank slots (user picks symbols via the dropdowns)
+    assert grid[0][0] == "Symbol →"
+    assert grid[0][1:] == [""] * PERFORMANCE_COMPARE_SLOTS
+    # lifetime rows present as VLOOKUP formulas into the Performance tab
+    labels = [r[0] for r in grid]
+    assert "Lifetime Total XIRR" in labels
+    lt_row = grid[labels.index("Lifetime Total XIRR")]
+    assert lt_row[1].startswith("=IF(B$1=") and "VLOOKUP" in lt_row[1]
+    # one Total + one Price per-year row per year, each TODAY()-relative
+    year_rows = [r for r in grid if isinstance(r[0], str)
+                 and r[0].startswith('=TEXT(YEAR(TODAY())')]
+    assert len(year_rows) == PERFORMANCE_COMPARE_YEARS * 2
+
+
+def test_write_performance_compare_sets_dropdown_validation():
+    sh, ws = _mock_sh_without_tab()
+    write_performance_compare(sh, slots=PERFORMANCE_COMPARE_SLOTS)
+    body = sh.batch_update.call_args[0][0]
+    dv = next(r for r in body["requests"] if "setDataValidation" in r)["setDataValidation"]
+    assert dv["rule"]["condition"]["type"] == "ONE_OF_RANGE"
+    assert dv["rule"]["condition"]["values"][0]["userEnteredValue"] == \
+        f"={TAB_PERFORMANCE}!$A$2:$A"
+    # dropdown spans the N slot cells in row 1 (cols B..)
+    assert dv["range"]["startColumnIndex"] == 1
+    assert dv["range"]["endColumnIndex"] == 1 + PERFORMANCE_COMPARE_SLOTS
+
+
+def test_write_performance_compare_idempotent_when_present():
+    ws = MagicMock()
+    ws.title = TAB_PERFORMANCE_COMPARE
+    sh = MagicMock()
+    sh.worksheets.return_value = [ws]
+    write_performance_compare(sh)
+    sh.add_worksheet.assert_not_called()
+    sh.batch_update.assert_not_called()

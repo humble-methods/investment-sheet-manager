@@ -2,14 +2,41 @@
 
 import os
 
-# Ticker normalization: Merrill symbol -> yfinance symbol
+from portfolio.models import CorporateAction
+
+# Ticker normalization: Merrill symbol -> yfinance symbol (same security, different
+# spelling — Merrill's vs. Yahoo's). Applied AFTER TICKER_RENAMES.
 SYMBOL_OVERRIDES: dict[str, str] = {
     "BRKB": "BRK-B",
+}
+
+# Ticker renames / corporate actions: a security that CHANGED tickers over time.
+# Maps the OLD ticker to a structured CorporateAction (NOT a bare new-ticker string)
+# so the registry can carry the action's kind/context now and ratios/effective dates
+# later (Phase 19) without reshaping call sites. Unifying old + new lets historical
+# bootstrap lots and new activity share one symbol for FIFO lot matching + yfinance —
+# without it, a SELL under the new ticker oversells (no lots exist under it). Distinct
+# from SYMBOL_OVERRIDES, which only fixes the Merrill-vs-Yahoo spelling of the SAME
+# ticker. Applied BEFORE SYMBOL_OVERRIDES so a renamed ticker can still get a spelling fix.
+TICKER_RENAMES: dict[str, CorporateAction] = {
+    # 84 sh held at bootstrap as ATGE in 53X-69S37, later sold as CVSA on 2026-06-03.
+    "ATGE": CorporateAction(
+        new_symbol="CVSA",
+        kind="rename",
+        note="Adtalem Global Education -> Covista Inc (CUSIP 00737L103)",
+    ),
 }
 
 # Skip these from equity processing (cash/money market)
 CASH_CUSIPS: set[str] = {"990156937"}
 CASH_SYMBOLS: set[str] = {"IIAXX"}
+
+# Symbols known to be unavailable on yfinance — e.g. brand-new spinoff ADRs Yahoo
+# hasn't indexed yet (SFGYY = Sony Financial Group, spun off Sep 2025). The runner
+# still attempts the fetch; this set only controls how a blank result is REPORTED:
+# listed symbols are logged as "expected" blanks rather than flagged as problems.
+# To REMAP a Merrill ticker to a working yfinance ticker instead, use SYMBOL_OVERRIDES.
+EXPECTED_MISSING_SYMBOLS: set[str] = {"SFGYY"}
 
 # Cash / money-market identifiers (per-account cash accounts, ~$1 NAV)
 CASH_SWEEP_CUSIP: str = "990156937"  # ML DIRECT DEPOSIT PROGRM (CMA cash)

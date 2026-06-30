@@ -106,6 +106,22 @@ def test_oversell_raises_value_error():
         build_lots(txns)
 
 
+def test_renamed_ticker_sell_depletes_bootstrap_lots():
+    # Regression: ATGE (Adtalem) renamed to CVSA (Covista). Bootstrap lots arrive
+    # under the OLD ticker; the later full SELL arrives under the NEW ticker. Both
+    # must normalize to one symbol or the SELL oversells (the reported crash:
+    # "Oversell: SELL of 84.0 CVSA ... exceeds available lots").
+    from portfolio.parsers.utils import clean_symbol
+
+    txns = [
+        make_tx("INIT_BUY", clean_symbol("ATGE"), 80, 1, price=29.20),
+        make_tx("INIT_BUY", clean_symbol("ATGE"), 4, 1, price=126.80),
+        make_tx("SELL", clean_symbol("CVSA"), -84, 2, price=124.11),
+    ]
+    positions = compute_positions(build_lots(txns), {"11A-00003": "CMA-Edge"})
+    assert positions == []  # 84 sold against 84 bootstrap shares; no oversell
+
+
 def test_dividend_is_ignored():
     txns = [
         make_tx("BUY", "X", 10, 1),

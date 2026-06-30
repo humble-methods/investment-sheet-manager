@@ -246,8 +246,32 @@ All symbol normalization lives in `portfolio/market/symbol_overrides.py`.
 
 *Add more overrides here as discovered.*
 
+### Ticker Renames / Corporate Actions
+When a security **changes tickers** (e.g. `ATGE` → `CVSA`, Adtalem Global Education →
+Covista), the bootstrap lots carry the OLD ticker while later activity uses the NEW one.
+`config.TICKER_RENAMES` maps the old ticker to a structured **`CorporateAction`** record
+(`new_symbol`, `kind`, `note`) — **not** a bare new-ticker string — so the registry can
+carry the action's context now and ratios/effective dates later (Phase 19) without reshaping
+call sites. `normalize_symbol` reads `action.new_symbol` to unify both into a single symbol
+for FIFO lot matching + yfinance. Applied **before** `SYMBOL_OVERRIDES`. Distinct from
+`SYMBOL_OVERRIDES`, which only fixes the Merrill-vs-Yahoo *spelling* of the SAME current
+ticker. (Mergers/splits with share changes are NOT covered by this — see Non-Obvious
+Behaviors #26 and BUILD_PLAN Phase 19.)
+
+| Old Ticker | Current Ticker | Notes |
+|-----------|----------------|-------|
+| `ATGE` | `CVSA` | Adtalem Global Education renamed to Covista Inc (CUSIP 00737L103) |
+
 ### ADR Symbols
 Merrill uses standard US ticker symbols for ADRs (`IX`, `TM`, `LYG`, `TSM`, etc.). These work directly with yfinance.
+
+### Symbols Unavailable on yfinance
+Some symbols return nothing from yfinance — notably brand-new spinoff ADRs Yahoo hasn't indexed yet
+(e.g. `SFGYY` = Sony Financial Group, spun off Sep 2025). The runner still attempts the fetch and
+degrades gracefully (blank row), and **surfaces** blank symbols into the Run Log notes
+(`No yfinance fundamentals: …` / `No price history: …`). `config.EXPECTED_MISSING_SYMBOLS` only
+controls *reporting* (expected vs. flagged) — it does NOT skip the fetch. To actually **remap** a
+Merrill ticker to a working yfinance ticker, use `SYMBOL_OVERRIDES`.
 
 ---
 
@@ -278,7 +302,9 @@ Merrill uses standard US ticker symbols for ADRs (`IX`, `TM`, `LYG`, `TSM`, etc.
 | `Holdings` | Current position summary per account. Derived by replaying Transactions. |
 | `Cash` | Per-account cash (CMA sweep 990156937 / Roth IIAXX): reconstructed vs snapshot + drift. |
 | `Stock Metrics` | Fundamentals + ROE per ticker for **every recorded symbol (held or since sold) + Watchlist**. Current price via GOOGLEFINANCE; fundamentals via yfinance. |
-| `Price History` | 5-year weekly closing prices (yfinance, Python-fetched values). One column per symbol on a shared `Date` axis. |
+| `Price History` | Anniversary closing-price snapshots (Today, 1Y–5Y Ago) — one **row per symbol** (yfinance, Python-fetched values). |
+| `Performance` | Lifetime annualized money-weighted return (XIRR) per symbol — total (dividends in) + price (out) + income contribution — plus a pooled `PORTFOLIO` row. **Backing data for `Performance Compare`.** |
+| `Performance By Year` | Per-(symbol, year) calendar-year return (non-annualized Modified Dietz), total + price. Long format; **backing data for `Performance Compare`.** |
 | `Run Log` | One row per run: timestamp, files processed, errors, holdings delta, skipped accounts, cash reconciliation. |
 
 **Editable tabs (human-maintained):**
@@ -286,6 +312,7 @@ Merrill uses standard US ticker symbols for ADRs (`IX`, `TM`, `LYG`, `TSM`, etc.
 | Tab | Description |
 |-----|-------------|
 | `Watchlist` | Tickers to track even if not held. **Read each run** and unioned into Stock Metrics + Price History. Single `Symbol` column; auto-created if missing, never overwritten. |
+| `Performance Compare` | Side-by-side per-symbol comparison. Fixed single-select dropdown slots (row 1) pick symbols; formulas below pull lifetime + per-year metrics from the `Performance` / `Performance By Year` tabs. **Scaffolded once, then never overwritten** — dropdown picks persist; cards self-refresh as the data tabs update. |
 
 Note: configuration (Drive folder IDs, spreadsheet ID, toggles) lives in `portfolio/config.py`,
 not a Settings tab — keep operational config in code. Per-account init dates are runtime state
@@ -317,15 +344,55 @@ the bootstrap; `snapshot` is from the latest Holdings CSV (blank if none this ru
 
 ### Stock Metrics tab
 Covers **every recorded symbol (held or sold) + Watchlist**. Python writes (from yfinance, each run):
-`Symbol | P/E Ratio | Dividend Yield | ROE (Current) | ROE (1Y Ago) | ROE (2Y Ago) | ROE (3Y Ago) | ROE (4Y Ago) | Net Income | Book Value | Current Price | As Of Date`
+`Symbol | P/E Ratio | Dividend Yield | ROE (Current) | ROE (1Y Ago) | … | ROE (10Y Ago) | Net Income | Book Value | Current Price | As Of Date`
 
+- Ten ROE-year columns (`ROE (1Y Ago)`…`ROE (10Y Ago)`, cols E–N). yfinance yields ~4 years per
+  fetch, so the later columns are blank now and self-fill over time (see Non-Obvious Behaviors).
+  Current Price is now col Q, As Of Date col R.
 - Current Price is a GOOGLEFINANCE formula (symbol in col A): `=IFERROR(GOOGLEFINANCE(A2, "price"), "N/A")`
-- The 52-week high/low columns were **removed**; 5-year history now lives on the Price History tab.
+- The 52-week high/low columns were **removed**; price history now lives on the Price History tab
+  (anniversary snapshots on the tab; full weekly series in the Drive cache).
 
 ### Price History tab
-5-year **weekly closing prices** fetched by Python/yfinance and written as **values** (not formulas):
-`Date | <symbol 1> | <symbol 2> | …` — one row per weekly date on a unified, sorted `Date` axis (the
-union of all symbols' dates; blank where a symbol lacks that week). Symbols sorted alphabetically.
+**Anniversary closing-price snapshots**, one **row per symbol** (symbols sorted alphabetically), written
+as **values** (not formulas):
+`Symbol | Today | 1Y Ago | 2Y Ago | 3Y Ago | 4Y Ago | 5Y Ago`
+Each value is the latest weekly close **on/before** that anniversary date (so up to ~1 week stale; blank
+if the symbol lacks history that far back). The full 5-yr weekly series is **retained in the Drive cache**
+(`price_history_cache.json`) and still feeds the Performance year-boundary math — this tab is the slimmed
+human-readable view. Anniversary dates: `today.replace(year=today.year − k)` (Feb 29 → Feb 28); the
+lookup (`close_on_or_before`) and `anniversary()` both live in `portfolio/metrics/pricing.py`.
+
+### Performance tab
+`Symbol | First Held | Current Value | Cost Basis | Lifetime Total XIRR | Lifetime Price XIRR | Income Contribution | As Of Date`
+
+One row per held symbol + a `PORTFOLIO` row. **Lifetime returns are annualized money-weighted XIRR**
+(total = dividends + ADR fees + foreign withholding included; price = excluded; `Income Contribution =
+Total − Price`). Terminal value uses the latest weekly close (Python). The `PORTFOLIO` row pools every
+symbol's flows + total current value — it is the **invested-sleeve** return, NOT a cash-inclusive
+whole-account IRR (external contributions are indistinguishable from sweeps, Decision 19). Returns are
+fractions (0..1).
+
+### Performance By Year tab
+`Symbol | Year | Begin Value | End Value | Net Flows | Dividends | Total Return | Price Return | As Of Date`
+
+One row per (symbol, year). **Per-year returns are non-annualized Modified Dietz** (NOT XIRR — avoids
+inflating partial-year holdings). A year is emitted only where the price history covers it. Begin/End
+values = year-boundary shares (`positions_as_of`) × year-end weekly close. Caveat: dividends exist only
+from each account's bootstrap cutoff forward, so total return slightly understates income for long-held
+bootstrapped lots.
+
+### Performance Compare tab (interactive)
+Not a flat row schema. **Column A** = metric labels; **row 1, cols B…** = fixed single-select dropdown
+slots (`PERFORMANCE_COMPARE_SLOTS` = 5) sourced from `=Performance!$A$2:$A`. Each slot drives one
+side-by-side card via formulas: lifetime rows `VLOOKUP` the `Performance` tab; per-year rows `INDEX/MATCH`
+the `Performance By Year` tab on a `symbol|year` key built inline with `ARRAYFORMULA`. Year rows are
+`YEAR(TODAY())`-relative (`PERFORMANCE_COMPARE_YEARS` = 6: current + 5 prior) so they self-update with no
+rewrite. **Scaffolded once** — `write_performance_compare` no-ops when the tab already exists, so the
+user's dropdown picks are never clobbered; cards refresh live as the data tabs are rewritten each run.
+Dropdowns + a frozen header/label are applied via the raw Sheets API (`sh.batch_update` →
+`setDataValidation` `ONE_OF_RANGE`). The Sheets API **cannot** create true multi-select "chip" dropdowns
+(UI-only) — convert a slot by hand if you want one; the `SPLIT`-agnostic lookups still work.
 
 ### Run Log tab
 `Run Timestamp | Files Processed | Init Rows Added | Transactions Added | Accounts Skipped | Errors | Holdings Changed | Cash Reconciliation | Duration (Sec) | Notes`
@@ -377,11 +444,28 @@ union of all symbols' dates; blank where a symbol lacks that week). Symbols sort
 - Sells deplete oldest lots first within the same account
 - Holdings recomputed from scratch each run by replaying full transaction history
 
-### Price Data: current via GOOGLEFINANCE, 5-yr history via Python
+### Price Data: current via GOOGLEFINANCE, history via Python
 - **Current** price: GOOGLEFINANCE formulas in the sheet (Holdings, Stock Metrics) — always fresh, no Python live-quote calls.
-- **5-year weekly closing history:** fetched by Python/yfinance into the `Price History` tab. A date-ranged series is a 2-D spill that can't fit a one-row-per-symbol tab, and the closes are wanted as values.
-- The 52-week high/low GOOGLEFINANCE columns were **removed** in favor of the full history.
+- **History:** Python/yfinance fetches the **5-yr weekly series into the Drive cache** (`price_history_cache.json`), which feeds the Performance year-boundary valuations. The `Price History` **tab** shows only **anniversary snapshots** (Today, 1Y–5Y Ago), one **row per symbol** — the slim human view; each value is the latest weekly close on/before that anniversary.
+- The 52-week high/low GOOGLEFINANCE columns were **removed** in favor of this history.
 - Python also writes fundamentals (ROE, P/E, dividend yield, net income, book value); ROE history = 4 years.
+
+### Performance: money-weighted returns (XIRR lifetime + Modified Dietz per-year)
+- **Lifetime = annualized XIRR** (money-weighted): every BUY/INIT_BUY/SELL at its date + dividends
+  (total flavor) + terminal current value. Comparable across symbols and holding periods.
+- **Per-year = non-annualized Modified Dietz** (`Performance By Year`): a calendar-year period return
+  that handles mid-year flows without the partial-year annualization blow-up XIRR would cause.
+- **Two flavors:** total (dividends + ADR fees + withholding in) and price (out); difference = income.
+- **PORTFOLIO row** = pooled invested-sleeve XIRR (all equity flows + total terminal value), NOT a
+  whole-account return — external contributions can't be separated from sweeps (Decision 19).
+- **Reuses** the same filtered transaction set as Holdings (`filter_and_partition`) so nothing is
+  double-counted; `positions_as_of` replays FIFO to a date for year-boundary share counts.
+- **Presentation is sheet-driven:** the numbers above are written to the `Performance` + `Performance By
+  Year` data tabs each run; the interactive **`Performance Compare`** tab (fixed dropdown slots → live
+  `VLOOKUP`/`INDEX-MATCH` formulas) renders side-by-side per-symbol cards on top of them. Scaffolded once
+  and never overwritten — the math stays in Python, the comparison stays in the sheet.
+- **Caveats:** per-year coverage is bounded by the 5-yr price-history window; pre-cutoff dividends are
+  absent, so total return understates income for long-held bootstrapped lots.
 
 ### yfinance Caching
 - **Two** Drive caches, each keyed by normalized ticker, 24hr TTL, keep-stale-on-failure:
@@ -452,6 +536,14 @@ union of all symbols' dates; blank where a symbol lacks that week). Symbols sort
 21. **CSV type detection is filename-first, then header-sniffing**: `detect_csv_type()` matches known Merrill prefixes (`PendingAndSettledActivity`/`Settled`→activity, `Holdings`, `Realized`, `Unrealized`); if the name doesn't match AND a filepath is given, it sniffs the header row (utf-8-sig). Fallback order is load-bearing: `Trade Date`→activity, `Unit Cost ($)`→unrealized, `Liquidation Date`→realized, `Price ($)`→holdings — `Price ($)` is checked LAST because activity rows also have it. Filename always wins over content. Without the fallback, user-renamed files (e.g. `activity_1.csv`) classify as `unknown` and are silently skipped → 0 rows processed on first run. Always pass the local path: `detect_csv_type(name, path)`.
 
 22. **Sheet header labels are decoupled from dedup keys**: Output headers are Title Case for humans, but the Transactions dedup reads rows back by **column position** against `TRANSACTIONS_KEYS` (writer.py), NOT by header text — which is why relabeling headers (snake_case → Title Case) is safe on an already-deployed sheet. Two invariants follow: (a) **never reorder Transactions columns** or change `TRANSACTIONS_KEYS` — existing rows would mis-map and re-import as duplicates; (b) `As Of Date` is last on Holdings/Cash/Stock Metrics, which are clear-and-rewrite (safe to reorder). Append-only tabs (Transactions, Run Log) get row 1 re-written each run via `_refresh_header` so the visible header stays current. The regression guard is `test_dedup_readback_is_position_based`.
+
+23. **`Performance Compare` is set-up-once — never make it clear-and-rewrite**: unlike every other Python-written tab, `write_performance_compare` **no-ops when the tab already exists** so the user's dropdown picks survive across runs. The cards stay current anyway because they are *formulas* into the `Performance`/`Performance By Year` data tabs (and the year rows are `YEAR(TODAY())`-relative). Clearing/rewriting it each run would silently wipe the selections — and the Sheets API can't recreate a true multi-select "chip" dropdown (UI-only), only the single-select `ONE_OF_RANGE` slots Python applies via `sh.batch_update`. Guards: `test_write_performance_compare_idempotent_when_present`, `test_write_performance_compare_sets_dropdown_validation`.
+
+24. **ROE history accumulates by calendar year across runs**: yfinance returns only ~4 annual columns per fetch, but Stock Metrics is provisioned for 10 years. The cache (`yfinance_cache.json`) stores `roe_by_year` keyed by the fiscal period-end's **calendar year** (string keys), and `fetch_fundamentals` **merges** each run's freshly-fetched years into the prior cached dict (fresh wins on collision) — older years persist even after they drop out of yfinance's window, so the cache grows toward 10 years over time. Two consequences: (a) **never replace the cached `roe_by_year` wholesale** on a fresh fetch — that destroys accumulated history; (b) sheet columns are **relative** (`ROE (NY Ago)`), mapped at write time by `year == run_year − N`, so blanks beyond ~4Y now self-fill on future runs. ROE pairs income/equity **by year**, not by column position. Guards: `test_roe_history_keyed_by_calendar_year`, `test_roe_history_accumulates_old_years_across_runs`, `test_write_stock_metrics_roe_relative_year_columns`.
+
+25. **Ticker renames cause a FIFO oversell if unmapped**: a security that changed tickers (a corporate action) arrives as bootstrap `INIT_BUY` lots under the OLD ticker but as `SELL` activity under the NEW ticker. `build_lots` matches lots by **exact symbol**, so the SELL finds zero lots and raises `Oversell: SELL of N <NEW> ... exceeds available lots`. Fix by adding `old → CorporateAction(new_symbol=…)` to `config.TICKER_RENAMES` (applied in `normalize_symbol`, so BOTH parsers unify the symbol at ingest — and `normalize_all` collapses any stale OLD rows already on the Transactions tab). This also explains a symbol "missing from yfinance": the old ticker is dead; the live one is the new symbol. First case: `ATGE → CVSA`. Guards: `test_normalize_applies_ticker_rename`, `test_renamed_ticker_sell_depletes_bootstrap_lots`.
+
+26. **Unmapped `(Type, Description 1)` combos are silently dropped from holdings**: the activity parser tags any combo not in `TX_TYPE_MAP` as `tx_type="UNKNOWN"` (logged, not raised) and `build_lots` ignores everything but BUY/INIT_BUY/SELL — so the row is kept in Transactions but has **zero effect on share counts or cash**. This is fine for true non-events, but real share/cash-moving types currently fall through this crack: **`SecurityTransactions / Stock Dividend Due Bill`** and **`SecurityTransactions / Dividend`** with a share quantity (stock dividends / splits — e.g. KLAC +306 on 34 sh ≈ 10-for-1, VGT +70 on 10 ≈ 8-for-1, in the 04–06/2026 file), plus **`FundTransfers / Funds Received`** (inbound cash) and **`FundReceipts / Current Year Contribution`** (Roth contribution). Effect: holdings **understate** post-split quantities (and it's a latent oversell next period if those shares are sold), and the Cash tab misses transfers. Handling these is **not yet built** — tracked in BUILD_PLAN Phase 19.
 
 ---
 

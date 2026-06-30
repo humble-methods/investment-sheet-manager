@@ -7,10 +7,12 @@ from datetime import date
 from typing import TYPE_CHECKING
 
 from portfolio.config import ACCOUNT_OWNERS
+from portfolio.metrics.pricing import anniversary, close_on_or_before
 from portfolio.models import CashBalance, Position, RunLogEntry, Transaction
 
 if TYPE_CHECKING:
     from portfolio.market.yfinance_client import PriceHistory, StockFundamentals
+    from portfolio.metrics.performance import SymbolPerformance, YearPerformance
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,9 @@ TAB_STOCK_METRICS = "Stock Metrics"
 TAB_RUN_LOG = "Run Log"
 TAB_WATCHLIST = "Watchlist"
 TAB_PRICE_HISTORY = "Price History"
+TAB_PERFORMANCE = "Performance"
+TAB_PERFORMANCE_BY_YEAR = "Performance By Year"
+TAB_PERFORMANCE_COMPARE = "Performance Compare"
 
 # Displayed header labels are Title Case (human-readable) and decoupled from the
 # internal field keys used for dedup read-back. Only the Transactions tab is ever
@@ -52,13 +57,18 @@ CASH_HEADERS = [
     "Account Number", "Account Registration", "Owner", "Cash Account",
     "Reconstructed", "Snapshot", "Drift", "As Of Date",
 ]
-# A=Symbol B=P/E Ratio C=Dividend Yield D=ROE (Current) E=ROE (1Y Ago)
-# F=ROE (2Y Ago) G=ROE (3Y Ago) H=ROE (4Y Ago) I=Net Income J=Book Value
-# K=Current Price L=As Of Date
+# A=Symbol B=P/E Ratio C=Dividend Yield D=ROE (Current) E..N=ROE (1Y..10Y Ago)
+# O=Net Income P=Book Value Q=Current Price R=As Of Date
+# The sheet is provisioned for 10 ROE years; yfinance yields ~4 per fetch, so the
+# later columns fill in over time as the cache accumulates (see yfinance_client).
+# Columns are RELATIVE ("N Y Ago"): at write time each ticker's calendar-year ROE
+# (cache key) is placed under column k where year == run_year - k.
 # 5-year weekly closes live on the separate Price History tab (fetched by Python).
+ROE_YEARS_BACK = 10
+_ROE_YEAR_HEADERS = [f"ROE ({k}Y Ago)" for k in range(1, ROE_YEARS_BACK + 1)]
 STOCK_METRICS_HEADERS = [
     "Symbol", "P/E Ratio", "Dividend Yield", "ROE (Current)",
-    "ROE (1Y Ago)", "ROE (2Y Ago)", "ROE (3Y Ago)", "ROE (4Y Ago)",
+    *_ROE_YEAR_HEADERS,
     "Net Income", "Book Value", "Current Price", "As Of Date",
 ]
 RUN_LOG_HEADERS = [
@@ -68,6 +78,27 @@ RUN_LOG_HEADERS = [
 ]
 # Human-maintained intake tab: one ticker per row under "Symbol".
 WATCHLIST_HEADERS = ["Symbol"]
+# Price History: one row per symbol; columns are anniversary snapshots back from
+# today (the latest weekly close on/before each anniversary date).
+PRICE_HISTORY_HEADERS = [
+    "Symbol", "Today", "1Y Ago", "2Y Ago", "3Y Ago", "4Y Ago", "5Y Ago",
+]
+# Performance: one row per symbol + a PORTFOLIO row. Returns are fractions (0..1).
+PERFORMANCE_HEADERS = [
+    "Symbol", "First Held", "Current Value", "Cost Basis",
+    "Lifetime Total XIRR", "Lifetime Price XIRR", "Income Contribution", "As Of Date",
+]
+# Per-year (long format): one row per (symbol, year). Returns are fractions (0..1).
+PERFORMANCE_BY_YEAR_HEADERS = [
+    "Symbol", "Year", "Begin Value", "End Value", "Net Flows", "Dividends",
+    "Total Return", "Price Return", "As Of Date",
+]
+# Performance Compare: interactive side-by-side cards, scaffolded once (set-up-once
+# like Watchlist). Fixed single-select dropdown slots feed live lookups into the
+# Performance / Performance By Year data tabs. Year rows = current year + 5 prior,
+# matching the 5-yr price-history window.
+PERFORMANCE_COMPARE_SLOTS = 5
+PERFORMANCE_COMPARE_YEARS = 6
 
 
 def get_gspread_client(credentials=None):
@@ -385,19 +416,22 @@ def write_stock_metrics(
     for i, (symbol, f) in enumerate(sorted(fundamentals.items())):
         row_num = i + 2
         sym_ref = f"A{row_num}"
+        # Project the calendar-year-keyed ROE cache onto relative columns:
+        # "N Y Ago" == fiscal year (run_year - N). Blank where no data yet.
+        roe_cols = []
+        for k in range(1, ROE_YEARS_BACK + 1):
+            value = f.roe_by_year.get(str(run_date.year - k))
+            roe_cols.append("" if value is None else value)
         rows.append([
             symbol,                                                # A
             "" if f.pe_ratio is None else f.pe_ratio,             # B
             "" if f.dividend_yield is None else f.dividend_yield,  # C
             "" if f.roe_current is None else f.roe_current,        # D
-            "" if f.roe_1y is None else f.roe_1y,                  # E
-            "" if f.roe_2y is None else f.roe_2y,                  # F
-            "" if f.roe_3y is None else f.roe_3y,                  # G
-            "" if f.roe_4y is None else f.roe_4y,                  # H
-            "" if f.net_income is None else f.net_income,          # I
-            "" if f.book_value is None else f.book_value,          # J
-            f'=IFERROR(GOOGLEFINANCE({sym_ref},"price"),"N/A")',   # K current_price
-            run_date.isoformat(),                                  # L as_of_date
+            *roe_cols,                                             # E..N (1Y..10Y Ago)
+            "" if f.net_income is None else f.net_income,          # O
+            "" if f.book_value is None else f.book_value,          # P
+            f'=IFERROR(GOOGLEFINANCE({sym_ref},"price"),"N/A")',   # Q current_price
+            run_date.isoformat(),                                  # R as_of_date
         ])
 
     if rows:
@@ -407,37 +441,209 @@ def write_stock_metrics(
 def write_price_history(
     sh: gspread.Spreadsheet,
     histories: dict[str, PriceHistory],
+    today: date | None = None,
 ) -> None:
-    """Overwrite the Price History tab with 5-yr weekly closes (one column per symbol).
+    """Overwrite the Price History tab: one row per symbol, columns are anniversary
+    snapshots back from ``today`` (Today, 1Y Ago … 5Y Ago).
 
-    Builds a unified, sorted Date axis (the union of every symbol's dates) so symbols
-    with different history lengths still align — blanks fill the gaps. Date is column
-    A; symbols are the remaining columns, sorted alphabetically (matching Stock Metrics).
+    Each value is the latest weekly close on/before that anniversary date, so it may be
+    up to ~a week stale. The fuller weekly series stays in the Drive cache (and feeds
+    the Performance year-boundary math); this tab is the slimmed human-readable view.
+    Symbols are rows, sorted alphabetically (matching Stock Metrics).
     """
-    ws = _ensure_tab(sh, TAB_PRICE_HISTORY, ["Date"])
+    today = today or date.today()
+    ws = _ensure_tab(sh, TAB_PRICE_HISTORY, PRICE_HISTORY_HEADERS)
     ws.clear()
+    ws.append_row(PRICE_HISTORY_HEADERS, value_input_option="USER_ENTERED")
 
-    symbols = sorted(histories)
-    by_symbol: dict[str, dict[str, float]] = {}
-    all_dates: set[str] = set()
-    for sym in symbols:
-        h = histories[sym]
-        pairs = dict(zip(h.dates, h.closes))
-        by_symbol[sym] = pairs
-        all_dates.update(pairs)
-
-    ws.append_row(["Date", *symbols], value_input_option="USER_ENTERED")
-
+    anchors = [anniversary(today, k) for k in range(len(PRICE_HISTORY_HEADERS) - 1)]
     rows = []
-    for d in sorted(all_dates):
-        row = [d]
-        for sym in symbols:
-            close = by_symbol[sym].get(d)
-            row.append("" if close is None else close)
+    for sym in sorted(histories):
+        h = histories[sym]
+        row = [sym]
+        for a in anchors:
+            c = close_on_or_before(h, a)
+            row.append("" if c is None else round(c, 4))
         rows.append(row)
 
     if rows:
         ws.append_rows(rows, value_input_option="RAW")
+
+
+def write_performance(
+    sh: gspread.Spreadsheet,
+    summaries: list[SymbolPerformance],
+    run_date: date,
+) -> None:
+    """Overwrite the Performance tab: lifetime annualized XIRR (total + price) per
+    symbol plus a pooled PORTFOLIO row. Returns are fractions (0..1) — format as %.
+    """
+    ws = _ensure_tab(sh, TAB_PERFORMANCE, PERFORMANCE_HEADERS)
+    ws.clear()
+    ws.append_row(PERFORMANCE_HEADERS, value_input_option="USER_ENTERED")
+
+    today = run_date.isoformat()
+    out = []
+    for s in summaries:
+        out.append([
+            s.symbol,                                                                  # A
+            "" if s.first_held is None else s.first_held.isoformat(),                  # B
+            round(s.current_value, 2),                                                 # C
+            round(s.cost_basis, 2),                                                    # D
+            "" if s.lifetime_total_xirr is None else round(s.lifetime_total_xirr, 6),  # E
+            "" if s.lifetime_price_xirr is None else round(s.lifetime_price_xirr, 6),  # F
+            "" if s.income_contribution is None else round(s.income_contribution, 6),  # G
+            today,                                                                     # H
+        ])
+
+    if out:
+        ws.append_rows(out, value_input_option="RAW")
+
+
+def write_performance_by_year(
+    sh: gspread.Spreadsheet,
+    yearly: list[YearPerformance],
+    run_date: date,
+) -> None:
+    """Overwrite the Performance By Year tab: one row per (symbol, year) with
+    non-annualized Modified Dietz total + price returns. Returns are fractions.
+    """
+    ws = _ensure_tab(sh, TAB_PERFORMANCE_BY_YEAR, PERFORMANCE_BY_YEAR_HEADERS)
+    ws.clear()
+    ws.append_row(PERFORMANCE_BY_YEAR_HEADERS, value_input_option="USER_ENTERED")
+
+    today = run_date.isoformat()
+    out = []
+    for y in yearly:
+        out.append([
+            y.symbol,                                                    # A
+            y.year,                                                      # B
+            round(y.begin_value, 2),                                     # C
+            round(y.end_value, 2),                                       # D
+            round(y.net_flows, 2),                                       # E
+            round(y.dividends, 2),                                       # F
+            "" if y.total_return is None else round(y.total_return, 6),  # G
+            "" if y.price_return is None else round(y.price_return, 6),  # H
+            today,                                                       # I
+        ])
+
+    if out:
+        ws.append_rows(out, value_input_option="RAW")
+
+
+_COMPARE_LIFETIME_ROWS = [
+    ("First Held", 2),
+    ("Current Value", 3),
+    ("Cost Basis", 4),
+    ("Lifetime Total XIRR", 5),
+    ("Lifetime Price XIRR", 6),
+    ("Income Contribution", 7),
+]
+
+
+def _compare_lifetime_formula(col: str, perf_col: int) -> str:
+    """VLOOKUP a lifetime metric (Performance column ``perf_col``) for the symbol
+    picked in ``{col}$1``; blank when the slot is empty or the symbol is missing."""
+    return (
+        f'=IF({col}$1="","",'
+        f'IFERROR(VLOOKUP({col}$1,{TAB_PERFORMANCE}!$A:$H,{perf_col},FALSE),""))'
+    )
+
+
+def _compare_year_formula(col: str, years_back: int, pby_col: str) -> str:
+    """INDEX/MATCH a (symbol, year) return from Performance By Year. ``years_back`` is
+    relative to TODAY() so the rows stay current with no rewrite; ``pby_col`` is the
+    data column letter (G total return, H price return)."""
+    pby = f"'{TAB_PERFORMANCE_BY_YEAR}'"
+    return (
+        f'=IF({col}$1="","",'
+        f'IFERROR(INDEX({pby}!${pby_col}$2:${pby_col},'
+        f'MATCH({col}$1&"|"&(YEAR(TODAY())-{years_back}),'
+        f'ARRAYFORMULA({pby}!$A$2:$A&"|"&{pby}!$B$2:$B),0)),""))'
+    )
+
+
+def _performance_compare_grid(slots: int, years: int) -> list[list[str]]:
+    """Label column + per-slot lookup formulas. Symbols are NOT pre-filled — the user
+    picks them via the row-1 dropdowns; year labels/rows use TODAY() so they self-update."""
+    letters = [chr(ord("B") + i) for i in range(slots)]
+    grid: list[list[str]] = [["Symbol →", *[""] * slots]]
+    for label, perf_col in _COMPARE_LIFETIME_ROWS:
+        grid.append([label, *[_compare_lifetime_formula(c, perf_col) for c in letters]])
+    grid.append(["", *[""] * slots])  # spacer between lifetime + per-year blocks
+    for k in range(years):
+        for suffix, pby_col in (("Total", "G"), ("Price", "H")):
+            label = f'=TEXT(YEAR(TODAY())-{k},"0")&" {suffix}"'
+            grid.append([label, *[_compare_year_formula(c, k, pby_col) for c in letters]])
+    return grid
+
+
+def write_performance_compare(
+    sh: gspread.Spreadsheet,
+    slots: int = PERFORMANCE_COMPARE_SLOTS,
+    years: int = PERFORMANCE_COMPARE_YEARS,
+) -> None:
+    """Scaffold the interactive Performance Compare tab (set-up-once).
+
+    Fixed single-select dropdown slots in row 1 (sourced from the Performance tab's
+    symbol column) each drive one side-by-side card of live lookups into the
+    Performance / Performance By Year data tabs. Every dynamic value is a formula
+    (years use TODAY()), so the view self-refreshes as those tabs update — we therefore
+    build it only when the tab is absent, never clobbering the user's slot picks.
+    """
+    if TAB_PERFORMANCE_COMPARE in {ws.title for ws in sh.worksheets()}:
+        return
+    grid = _performance_compare_grid(slots, years)
+    ws = sh.add_worksheet(
+        title=TAB_PERFORMANCE_COMPARE,
+        rows=max(len(grid) + 5, 26),
+        cols=max(slots + 1, 26),
+    )
+    ws.update(values=grid, range_name="A1", value_input_option="USER_ENTERED")
+    _apply_compare_dropdowns(sh, ws, slots)
+
+
+def _apply_compare_dropdowns(sh, ws, slots: int) -> None:
+    """Put a single-select dropdown on each row-1 slot (B1…), sourced from the
+    Performance symbol column, and freeze the header row + label column. Uses the raw
+    Sheets API via gspread's ``batch_update`` — gspread has no data-validation helper."""
+    source = f"={TAB_PERFORMANCE}!$A$2:$A"
+    sh.batch_update({
+        "requests": [
+            {
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": 0, "endRowIndex": 1,
+                        "startColumnIndex": 1, "endColumnIndex": 1 + slots,
+                    },
+                    "rule": {
+                        "condition": {
+                            "type": "ONE_OF_RANGE",
+                            "values": [{"userEnteredValue": source}],
+                        },
+                        "showCustomUi": True,
+                        "strict": False,
+                    },
+                }
+            },
+            {
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": ws.id,
+                        "gridProperties": {
+                            "frozenRowCount": 1,
+                            "frozenColumnCount": 1,
+                        },
+                    },
+                    "fields": (
+                        "gridProperties.frozenRowCount,"
+                        "gridProperties.frozenColumnCount"
+                    ),
+                }
+            },
+        ]
+    })
 
 
 def write_run_log(sh: gspread.Spreadsheet, entry: RunLogEntry) -> None:

@@ -25,9 +25,20 @@ from portfolio.drive.archiver import (
     save_yfinance_cache,
 )
 from portfolio.engine.cash import reconcile_cash, reconstruct_cash
-from portfolio.engine.holdings import compute_holdings, verify_against_snapshot
+from portfolio.engine.holdings import (
+    compute_holdings,
+    filter_and_partition,
+    positions_as_of,
+    verify_against_snapshot,
+)
+from portfolio.config import EXPECTED_MISSING_SYMBOLS
 from portfolio.market.symbol_overrides import normalize_all
-from portfolio.market.yfinance_client import fetch_fundamentals, fetch_price_history
+from portfolio.market.yfinance_client import (
+    fetch_fundamentals,
+    fetch_price_history,
+    is_empty_fundamentals,
+)
+from portfolio.metrics.performance import build_performance
 from portfolio.models import RunLogEntry, Transaction
 from portfolio.parsers.activity_parser import parse_activity_csv
 from portfolio.parsers.holdings_parser import parse_holdings_csv
@@ -41,6 +52,9 @@ from portfolio.sheets.writer import (
     load_watchlist_symbols,
     write_cash,
     write_holdings,
+    write_performance,
+    write_performance_by_year,
+    write_performance_compare,
     write_price_history,
     write_run_log,
     write_stock_metrics,
@@ -250,15 +264,59 @@ def run_update(credentials=None) -> None:
     save_yfinance_cache(service, cache_id, yf_cache)
     print(f"Fetched fundamentals for {len(fundamentals)} symbol(s)")
 
+    # Surface symbols yfinance returned nothing for, so they don't silently become
+    # blank Stock Metrics rows. Split expected (config) from unexpected for the log.
+    blank_fund = sorted(s for s, f in fundamentals.items() if is_empty_fundamentals(f))
+    unexpected_blank = [s for s in blank_fund if s not in EXPECTED_MISSING_SYMBOLS]
+    expected_blank = [s for s in blank_fund if s in EXPECTED_MISSING_SYMBOLS]
+    if unexpected_blank:
+        notes.append(f"No yfinance fundamentals: {', '.join(unexpected_blank)}")
+    if expected_blank:
+        notes.append(f"No yfinance fundamentals (expected): {', '.join(expected_blank)}")
+
     # --- 17b. Load cache, fetch 5-yr weekly closing prices, save cache ---
     ph_cache = load_price_history_cache(service, cache_id)
     histories = fetch_price_history(symbols, ph_cache)
     save_price_history_cache(service, cache_id, ph_cache)
     print(f"Fetched price history for {len(histories)} symbol(s)")
 
+    blank_hist = sorted(s for s, h in histories.items() if not h.closes)
+    if blank_hist:
+        notes.append(f"No price history: {', '.join(blank_hist)}")
+
     # --- 18. Write Stock Metrics + Price History ---
     write_stock_metrics(sh, fundamentals, date.today())
     write_price_history(sh, histories)
+
+    # --- 18b. Performance (lifetime XIRR + per-year Modified Dietz, total & price) ---
+    today = date.today()
+    latest_close = {sym: h.closes[-1] for sym, h in histories.items() if h.closes}
+    kept_txns, _ = filter_and_partition(all_transactions, account_state)
+    txns_by_symbol: dict[str, list[Transaction]] = defaultdict(list)
+    for tx in kept_txns:
+        if tx.symbol:
+            txns_by_symbol[tx.symbol].append(tx)
+    perf_current_value: dict[str, float] = defaultdict(float)
+    perf_cost_basis: dict[str, float] = defaultdict(float)
+    for p in positions:
+        perf_current_value[p.symbol] += p.quantity * (latest_close.get(p.symbol) or 0.0)
+        perf_cost_basis[p.symbol] += p.total_cost_basis
+    # Year-end share snapshots over the price-history window (+1 year back for opening
+    # values); positions_as_of replays the same filtered set as holdings.
+    shares_by_yearend: dict[int, dict[str, float]] = {}
+    for y in range(today.year - 6, today.year):
+        agg: dict[str, float] = defaultdict(float)
+        for p in positions_as_of(all_transactions, account_state, date(y, 12, 31)):
+            agg[p.symbol] += p.quantity
+        shares_by_yearend[y] = dict(agg)
+    perf_summaries, perf_yearly = build_performance(
+        sorted(perf_cost_basis), dict(txns_by_symbol), dict(perf_current_value),
+        dict(perf_cost_basis), shares_by_yearend, histories, today,
+    )
+    write_performance(sh, perf_summaries, today)
+    write_performance_by_year(sh, perf_yearly, today)
+    write_performance_compare(sh)  # set-up-once interactive comparison tab
+    print(f"Performance: {len(perf_summaries)} symbol row(s), {len(perf_yearly)} year row(s)")
 
     # --- 19. Save updated account_state ---
     save_account_state(service, cache_id, account_state)

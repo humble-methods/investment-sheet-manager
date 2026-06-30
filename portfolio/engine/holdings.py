@@ -1,5 +1,7 @@
 """Holdings replay: apply cutoff/skip rules, build lots, verify vs snapshot."""
 
+from datetime import date
+
 from portfolio.engine.fifo import build_lots, compute_positions
 from portfolio.models import Position, Transaction
 from portfolio.parsers.utils import parse_date
@@ -54,6 +56,27 @@ def compute_holdings(
     registrations = {tx.account_number: tx.account_registration for tx in kept}
     positions = compute_positions(build_lots(kept), registrations)
     return positions, skipped
+
+
+def positions_as_of(
+    transactions: list[Transaction],
+    account_state: dict[str, dict],
+    as_of: date,
+) -> list[Position]:
+    """Positions held at end-of-day ``as_of``.
+
+    Same filtered set as compute_holdings (per-account cutoff + un-bootstrapped
+    skip), additionally dropping any transaction with trade_date > as_of, then
+    FIFO-replayed. Used for year-boundary share snapshots in the Performance tab.
+
+    NOTE: for as_of dates BEFORE an account's init_date this reflects only the
+    surviving bootstrap lots (acquired on/before as_of); intra-history round trips
+    closed before the bootstrap are not visible. Reliable from init_date forward.
+    """
+    kept, _ = filter_and_partition(transactions, account_state)
+    as_of_txns = [tx for tx in kept if tx.trade_date <= as_of]
+    registrations = {tx.account_number: tx.account_registration for tx in as_of_txns}
+    return compute_positions(build_lots(as_of_txns), registrations)
 
 
 def verify_against_snapshot(

@@ -1,6 +1,10 @@
 from datetime import date
 
-from portfolio.engine.cash import cash_account_for, reconcile_cash, reconstruct_cash
+from portfolio.engine.cash import (
+    cash_account_for,
+    reconcile_cash,
+    reconstruct_cash,
+)
 from portfolio.models import Transaction
 
 STATE = {

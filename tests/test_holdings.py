@@ -3,6 +3,7 @@ from datetime import date
 from portfolio.engine.holdings import (
     compute_holdings,
     filter_and_partition,
+    positions_as_of,
     verify_against_snapshot,
 )
 from portfolio.models import Position, Transaction
@@ -76,6 +77,25 @@ def test_compute_holdings_replays_init_plus_activity():
     positions, _ = compute_holdings(txns, STATE)
     assert len(positions) == 1
     assert positions[0].quantity == 12
+
+
+def test_positions_as_of_year_boundary_with_midyear_buy_and_sell():
+    txns = [
+        make_tx("INIT_BUY", "X", 10, date(2022, 1, 1)),
+        make_tx("BUY", "X", 5, date(2026, 2, 1)),
+        make_tx("SELL", "X", -3, date(2026, 3, 1)),
+    ]
+    # End of 2025: only the INIT lot exists; 2026 activity is in the future.
+    assert {p.symbol: p.quantity for p in positions_as_of(txns, STATE, date(2025, 12, 31))} == {"X": 10}
+    # Mid-Feb 2026: INIT 10 + BUY 5, sell not yet.
+    assert {p.symbol: p.quantity for p in positions_as_of(txns, STATE, date(2026, 2, 15))} == {"X": 15}
+    # Mid-Mar 2026: 10 + 5 - 3.
+    assert {p.symbol: p.quantity for p in positions_as_of(txns, STATE, date(2026, 3, 15))} == {"X": 12}
+
+
+def test_positions_as_of_excludes_unbootstrapped_accounts():
+    txns = [make_tx("BUY", "Y", 7, date(2026, 2, 1), account="99Z-99999")]
+    assert positions_as_of(txns, STATE, date(2026, 12, 31)) == []
 
 
 def test_verify_against_snapshot_ok_and_mismatch():

@@ -49,8 +49,14 @@ Identical *activity* fills (same date/account/symbol/qty/amount within a settled
 ### Realized CSV: unused for MVP (confirmed)
 Activity is a strict superset for the ongoing flow (BUY/SELL **plus** dividends, interest, ADR fees, tax withholding, cash sweeps). Realized only carries matched closed lots and uses internal security codes (not tickers). Any realized P&L can be computed by the FIFO engine. **Realized CSV is not ingested.**
 
-### Corporate actions: out of scope for MVP (confirmed)
-Splits / renames / mergers are handled by **manual intervention** — the user re-pulls and adjusts position files when one occurs. The engine should **flag unmapped `(Type, Description 1)` combos** as `UNKNOWN` rather than attempt to handle them.
+### Corporate actions: partially handled (amended post-MVP)
+Originally **all** corporate actions were out of scope (manual intervention; flag unmapped
+combos as `UNKNOWN`). Two amendments:
+- **Ticker renames are now handled in code** via `config.TICKER_RENAMES` (Phase 18) — a rename
+  otherwise oversells (bootstrap lots under the old ticker, SELL under the new). First case `ATGE → CVSA`.
+- **Splits / stock dividends + inbound transfers** remain unhandled today: the parser still tags
+  them `UNKNOWN` and `build_lots` ignores them, so share counts understate post-split and the Cash
+  tab misses transfers. Handling these is **planned in Phase 19** (not yet built). Mergers stay manual.
 
 ### Price strategy: current via GOOGLEFINANCE, history via Python (Phase 11, partial reversal)
 The original rule ("all price data via GOOGLEFINANCE; Python never fetches prices") is **partially reversed**: **5-year weekly historical closes are fetched by Python/yfinance** and written to a dedicated `Price History` tab, while the **current price stays a live GOOGLEFINANCE formula** on Holdings and Stock Metrics. Rationale: a date-ranged series is a 2-D spill that can't live one-row-per-symbol, and the user wants the raw closes available as values. The 52-week high/low GOOGLEFINANCE columns are removed in favor of the full history. (Amends the Phase 4/5 notes below.)
@@ -567,6 +573,10 @@ for d in diffs: print(d)
 ## Phase 4 — Market Data (yfinance + Cache)
 **Goal:** Fetch fundamental data for all held symbols; cache to Drive; provide 4 years of ROE history.
 
+> **Superseded by Phase 17:** the flat `roe_1y…roe_4y` dataclass fields + cache keys below are
+> replaced by a calendar-year-keyed `roe_by_year` dict that accumulates across runs (10-yr sheet
+> capacity). See Phase 17 for the current shape.
+
 ### Deliverables
 - `portfolio/market/symbol_overrides.py`
 - `portfolio/market/yfinance_client.py`
@@ -951,6 +961,180 @@ python3 -m pytest -q   # full suite green
 
 ---
 
+## Phase 12 — Composition Tab (REMOVED)
+**Status:** Removed after the first build. Market-value vs cost-basis weighting is better done with the
+sheet's own pivot/chart tooling than a Python-maintained data tab. Deleted `portfolio/metrics/composition.py`,
+`write_composition` + `TAB_COMPOSITION`/`COMPOSITION_HEADERS`, `COMPOSITION_OTHER_THRESHOLD`,
+`tests/test_composition.py`, and runner step 18b. May return later as a sheet-native view.
+
+---
+
+## Phase 13 — Performance Tab (lifetime XIRR + per-year Modified Dietz)
+**Goal:** Annualized money-weighted return per symbol (lifetime) + per-calendar-year returns, each total (dividends in) and price (out), comparable across symbols and entry years.
+
+### Deliverables
+- `portfolio/metrics/performance.py` (`xirr`, `modified_dietz`, `lifetime_cashflows`, `year_returns`, `build_performance`, `SymbolPerformance`, `YearPerformance`)
+- `portfolio/engine/holdings.py` (`positions_as_of` — reuses `filter_and_partition` + `build_lots`)
+- `portfolio/sheets/writer.py` (`write_performance`, `write_performance_by_year` + tabs/headers)
+- `portfolio/runner.py` (step 18c), `tests/test_performance.py`, `tests/test_holdings.py`, `tests/test_writer.py`
+
+### Approach
+- **Lifetime = annualized XIRR** (Newton + bisection fallback, no scipy): buys/sells at `tx.amount`, dividends (total only), terminal = current value. **Per-year = non-annualized Modified Dietz** (avoids partial-year annualization blow-up). `Income = total − price`.
+- Per symbol consolidated across accounts + a pooled `PORTFOLIO` row (invested-sleeve XIRR; not whole-account — sidesteps Decision 19). Total leg nets ADR fees + foreign withholding.
+- Per-year begin/end values = year-boundary shares (`positions_as_of(Dec 31)`) × year-end weekly close from `PriceHistory`; reuses the **same filtered txn set** as Holdings (no double counting).
+- **Presentation:** these two tabs are **backing data** only; the interactive side-by-side view is the new `Performance Compare` tab (Phase 16). Computation here is unchanged (calendar-year Modified Dietz), fed by the 5-yr weekly series now retained in the Drive cache (Phase 15).
+
+### Tests
+`xirr` known IRRs + sign edge cases → None; `modified_dietz` closed-form + time-weighting; `lifetime_cashflows` total vs price (fee netting); `year_returns` extraction; `positions_as_of` mid-year buy/sell at a year boundary; `build_performance` integration (chained year values, PORTFOLIO row).
+
+### Validation
+```bash
+python3 -m pytest tests/test_performance.py tests/test_holdings.py -q   # yfinance monkeypatched, never live
+```
+
+### Caveats (in tab notes / docs)
+Per-year coverage is bounded by the 5-yr price-history window; pre-cutoff dividends are absent so total return understates income for long-held bootstrapped lots; terminal/current price is the latest weekly close (≤ ~1 wk stale).
+
+---
+
+## Phase 14 — Opportunity Cost of Idle Cash (REMOVED)
+**Status:** Removed after the first build — the idle-cash-drag framing wasn't as exhaustive/useful as hoped
+and needs rethinking. Deleted `portfolio/metrics/opportunity.py`, `engine/cash.py::cash_balance_series`,
+`write_opportunity_cost` + tab/headers, `tests/test_opportunity.py` (+ its `test_cash.py` cases), and runner
+step 18d. `reconstruct_cash` and the Cash tab are untouched. To be re-evaluated.
+
+---
+
+## Phase 15 — Price History → anniversary snapshots, symbols as rows
+**Goal:** Replace the wide weekly Price History tab (one column per symbol, ~260 date rows) with a compact
+**one-row-per-symbol** view of anniversary closes (Today, 1Y–5Y Ago). The full weekly series stays in the
+Drive cache for the Performance year-boundary math.
+
+### Deliverables
+- `portfolio/metrics/pricing.py` (NEW; `close_on_or_before`, `anniversary`) — shared, dependency-light (stdlib only).
+- `portfolio/metrics/performance.py` (`_close_on_or_before` now aliases the shared helper).
+- `portfolio/sheets/writer.py` (`write_price_history` reshaped; `PRICE_HISTORY_HEADERS`).
+- `tests/test_pricing.py` (NEW), `tests/test_writer.py`.
+
+### Approach
+- yfinance fetch + `price_history_cache.json` **unchanged** (still 5-yr weekly) — only the *tab* changes.
+- Per symbol (sorted): write `Symbol | Today | 1Y Ago | … | 5Y Ago`, each = `close_on_or_before(history, anniversary(today, k))`. Blank where the symbol lacks history that far back. `anniversary` = `today.replace(year=today.year − k)` with a Feb 29 → Feb 28 fallback.
+- `write_price_history(sh, histories, today=None)` gains `today` for deterministic tests.
+
+### Tests
+`close_on_or_before` last-on-or-before + None/empty; `anniversary` basic + leap-day; `write_price_history` one row per symbol, correct anniversary picks, blanks for short history, header-only when empty.
+
+### Validation
+```bash
+python3 -m pytest tests/test_pricing.py tests/test_writer.py -q
+```
+
+---
+
+## Phase 16 — Performance Compare (interactive side-by-side cards)
+**Goal:** Replace "all symbols listed at once" with a **sheet-driven** comparison: pick a few symbols and see
+their lifetime + per-year metrics as side-by-side cards. Computation stays in Python; interaction lives in the sheet.
+
+### Deliverables
+- `portfolio/sheets/writer.py` (`write_performance_compare`, `_performance_compare_grid`, `_compare_lifetime_formula`, `_compare_year_formula`, `_apply_compare_dropdowns`, `TAB_PERFORMANCE_COMPARE`, `PERFORMANCE_COMPARE_SLOTS = 5`, `PERFORMANCE_COMPARE_YEARS = 6`).
+- `portfolio/runner.py` (step 18b, after the Performance data tabs).
+- `tests/test_writer.py`.
+
+### Approach
+- **Backing data** = the existing `Performance` (lifetime) + `Performance By Year` (long) tabs, rewritten each run.
+- **Presentation** = a scaffolded tab: col A metric labels; row-1 cols B… are fixed **single-select dropdown slots** sourced from `=Performance!$A$2:$A`. Lifetime rows `VLOOKUP` the Performance tab; per-year rows `INDEX/MATCH` Performance By Year on a `symbol|year` key built inline with `ARRAYFORMULA`. Year rows are `YEAR(TODAY())`-relative so they self-update.
+- **Set-up-once:** `write_performance_compare` no-ops if the tab exists (never clobbers the user's picks); cards refresh live because they're formulas. Dropdowns + frozen header/label applied via `sh.batch_update` (`setDataValidation` `ONE_OF_RANGE`).
+- **Decisions:** calendar-year (not trailing) per-period returns; fixed dropdown slots (not multi-select) — the Sheets API can't create true multi-select "chip" dropdowns (UI-only).
+
+### Tests
+Scaffolds when absent (grid: label col, blank slots, VLOOKUP lifetime rows, `YEAR(TODAY())` year rows); sets `ONE_OF_RANGE` validation over the N slots; **idempotent** no-op when the tab already exists.
+
+### Validation
+```bash
+python3 -m pytest tests/test_writer.py -q
+```
+
+---
+
+## Phase 17 — ROE History by Calendar Year (accumulating) + 10-Year Capacity
+**Goal:** Make Stock Metrics ROE accumulate toward 10 years even though yfinance returns only ~4
+annual columns per fetch, and surface symbols that come back empty from yfinance. **Status: built.**
+
+### Deliverables
+- `portfolio/metrics/fundamentals.py` (`roe_history` returns `{calendar_year: roe}`; pairs income/equity by year; `_annual_pairs`, `_column_year`)
+- `portfolio/market/yfinance_client.py` (`StockFundamentals.roe_by_year` replaces `roe_1y…roe_4y`; `fetch_fundamentals` merges fresh years into the cached dict; `is_empty_fundamentals`)
+- `portfolio/sheets/writer.py` (`STOCK_METRICS_HEADERS` → 10 relative `ROE (NY Ago)` cols; `write_stock_metrics` maps calendar-year cache → relative columns by `run_year − N`)
+- `portfolio/config.py` (`EXPECTED_MISSING_SYMBOLS`), `portfolio/runner.py` (Run Log notes for blank fundamentals/history)
+- `tests/test_fundamentals.py`, `tests/test_yfinance_client.py`, `tests/test_writer.py`
+
+### Approach
+- **Accumulate by calendar year:** the cache keys ROE by the fiscal period-end's calendar year (string keys); each run unions newly-fetched years into the prior cached dict (fresh wins). Old years persist after they age out of yfinance's ~4-yr window, so the cache grows toward 10 over time. Never replace `roe_by_year` wholesale.
+- **Relative columns** (`ROE (1Y Ago)…(10Y Ago)`): the writer projects the calendar-year cache onto column `k` where `year == run_year − k`. ~4 fill now; later columns self-fill on future runs.
+- **Surface blanks:** `is_empty_fundamentals` → runner logs `No yfinance fundamentals: …` / `No price history: …` to the Run Log, split into expected (`EXPECTED_MISSING_SYMBOLS`, e.g. `SFGYY`) vs. flagged.
+
+### Tests
+`roe_history` keyed by year + income/equity aligned by year (not position); cross-run accumulation retains old years; `is_empty_fundamentals`; writer relative-year column mapping + 10 provisioned columns.
+
+### Validation
+```bash
+python3 -m pytest tests/test_fundamentals.py tests/test_yfinance_client.py tests/test_writer.py -q
+```
+
+---
+
+## Phase 18 — Ticker Renames (corporate-action symbol unification)
+**Goal:** A security that changed tickers must unify its old (bootstrap) and new (activity) symbols so
+the post-rename SELL doesn't oversell. **Status: built.**
+
+### Deliverables
+- `portfolio/models.py` (`CorporateAction` dataclass — structured rename record)
+- `portfolio/config.py` (`TICKER_RENAMES: dict[str, CorporateAction]`, seeded `ATGE → CVSA`)
+- `portfolio/market/symbol_overrides.py` (`normalize_symbol` applies `TICKER_RENAMES` BEFORE `SYMBOL_OVERRIDES`)
+- `tests/test_symbol_overrides.py`, `tests/test_fifo.py`
+
+### Approach
+- Corporate-action normalization maps to a **structured `CorporateAction`** (`new_symbol`, `kind`, `note`), not a bare old→new string — extensible to splits/mergers (ratios, effective dates) in Phase 19 without reshaping call sites.
+- `normalize_symbol` is the single chokepoint both parsers use via `clean_symbol`, so a rename there unifies bootstrap `INIT_BUY` lots and later activity at ingest. `normalize_all` then collapses any stale OLD ticker still on the Transactions tab, so yfinance fetches only the live ticker.
+- Two-stage: rename (old→current, via `action.new_symbol`) first, then Merrill→Yahoo spelling override — a renamed ticker can still get a spelling fix.
+
+### Tests
+`normalize_symbol("ATGE") == "CVSA"`; rename-then-spelling chaining; `normalize_all` collapses old+new to one; FIFO regression — INIT_BUY under old ticker + full SELL under new ticker depletes cleanly (reproduces the reported `Oversell` crash).
+
+### Validation
+```bash
+python3 -m pytest tests/test_symbol_overrides.py tests/test_fifo.py -q
+```
+
+---
+
+## Phase 19 — Stock Dividends / Splits + Inbound Transfers (PLANNED)
+**Goal:** Stop silently dropping share- and cash-moving activity types the parser currently tags `UNKNOWN`
+(see Non-Obvious Behaviors #26). Without this, holdings understate post-split quantities (a latent oversell
+next period) and the Cash tab misses transfers. **Status: not yet built.**
+
+### Scope (observed in the 04–06/2026 activity file)
+- **`SecurityTransactions / Stock Dividend Due Bill`** and **`SecurityTransactions / Dividend`** with a *share* quantity and `$0.00` amount — these are stock dividends / splits delivered as shares. Observed netting per (account, symbol): a `+N` due bill, a `−N` due bill reversal, then a `+N` Dividend → **net `+N` shares**. Examples: KLAC `73S-17D17` +306 on 34 sh (≈10-for-1); VGT `53X-69S37` +70 on 10 sh (≈8-for-1).
+- **`FundTransfers / Funds Received`** — inbound cash (e.g. two $30,000 wires); affects the cash ledger, not equity.
+- **`FundReceipts / Current Year Contribution`** — Roth contribution (e.g. $8,000); cash-in.
+
+### Deliverables (proposed)
+- `portfolio/parsers/activity_parser.py` — extend `TX_TYPE_MAP` with the new combos → new canonical types (e.g. `STOCK_DIVIDEND` / `SPLIT`, `CASH_IN`).
+- `portfolio/engine/fifo.py` — a share-adding event that creates a `$0` cost lot (split/stock-dividend: total cost basis unchanged, avg cost drops across more shares). Decide due-bill netting so `+N/−N/+N` resolves to one `+N`.
+- `portfolio/engine/cash.py` — fold `Funds Received` / contributions into `reconstruct_cash` (mind the sweep double-count hazard, Decision/Phase 3).
+- `tests/test_activity_parser.py`, `tests/test_fifo.py`, `tests/test_cash.py`.
+
+### Open questions (confirm before building)
+- **Due-bill semantics:** is the canonical interpretation always `+N` (due bill) → `−N` (reversal) → `+N` (dividend) = net `+N`, or can the dividend/due-bill arrive without the pair? Validate against another multi-period file.
+- **Cost-basis treatment:** treat as a split (spread existing basis over new shares, $0 added basis) — confirm vs. a taxable stock dividend (basis = FMV).
+- **Cash double-count:** confirm `Funds Received` is NOT also mirrored by a sweep `Deposit` row (which would double-count, per Phase 3's hazard).
+
+### Validation
+```bash
+python3 -m pytest tests/test_activity_parser.py tests/test_fifo.py tests/test_cash.py -q
+```
+
+---
+
 ## Phase Sequence & Dependencies
 
 ```
@@ -968,6 +1152,16 @@ Post-MVP enhancements (sequence by dependency, not number):
 Phase 9 (Human headers, dedup-safe reads)
     └── Phase 10 (Metrics scope + Watchlist)  ← uses Phase 9's TRANSACTIONS_KEYS reads
             └── Phase 11 (5-yr Price History)  ← consumes Phase 10's symbol set
+                    ├── Phase 12 (Composition)       ← REMOVED (use native sheet charts)
+                    ├── Phase 13 (Performance)       ← + FIFO as-of + transactions (backing data)
+                    │       └── Phase 16 (Performance Compare)  ← interactive cards on Phase 13's tabs
+                    ├── Phase 14 (Opportunity Cost)  ← REMOVED (re-evaluate)
+                    └── Phase 15 (Price History reshape)  ← anniversary snapshots, rows = symbols
+
+Cross-cutting (corporate actions + metrics depth; sequence by dependency):
+Phase 17 (ROE by calendar year, 10-yr capacity)  ← supersedes Phase 4 ROE fields [built]
+Phase 18 (Ticker renames, TICKER_RENAMES)         ← fixes rename oversell in Phase 3 FIFO [built]
+Phase 19 (Stock dividends/splits + transfers)     ← extends Phase 2 parser + Phase 3 FIFO/cash [planned]
 Phase 8 (Hardening) is orthogonal — do it before or after 9–11.
 ```
 

@@ -39,8 +39,8 @@ def _fake_factory(info=None, fin=None, bs=None):
 def _full_entry(symbol="AAPL", **overrides):
     entry = {
         "symbol": symbol, "pe_ratio": None, "dividend_yield": None,
-        "roe_current": None, "roe_1y": None, "roe_2y": None, "roe_3y": None,
-        "roe_4y": None, "net_income": None, "book_value": None,
+        "roe_current": None, "roe_by_year": {}, "net_income": None,
+        "book_value": None,
         "fetched_at": datetime.now().isoformat(timespec="seconds"),
     }
     entry.update(overrides)
@@ -56,10 +56,28 @@ def test_cache_miss_fetches_and_populates(monkeypatch):
     assert f.pe_ratio == 28.4
     assert f.dividend_yield == 0.0055
     assert f.roe_current == 1.47
-    assert f.roe_1y == pytest.approx(94.0 / 64.0)
+    # ROE keyed by calendar year (string keys for JSON); _COLS = 2025..2022
+    assert f.roe_by_year["2025"] == pytest.approx(94.0 / 64.0)
+    assert f.roe_by_year["2022"] == pytest.approx(70.0 / 50.0)
     assert f.net_income == 94.0 and f.book_value == 64.0
     # cache was populated in place with a JSON-serializable dict
     assert cache["AAPL"]["pe_ratio"] == 28.4
+    assert cache["AAPL"]["roe_by_year"]["2025"] == pytest.approx(94.0 / 64.0)
+
+
+def test_roe_history_accumulates_old_years_across_runs(monkeypatch):
+    # A prior run captured 2021 (now out of yfinance's window); a fresh fetch
+    # returns 2022-2025. The merged cache must retain 2021 AND gain the new years.
+    monkeypatch.setattr(yfinance_client, "_ticker", _fake_factory())
+    old = (datetime.now() - timedelta(hours=48)).isoformat(timespec="seconds")
+    cache = {"AAPL": _full_entry(roe_by_year={"2021": 1.11}, fetched_at=old)}
+    out = fetch_fundamentals(["AAPL"], cache, ttl_hours=24)
+
+    roes = out["AAPL"].roe_by_year
+    assert roes["2021"] == 1.11                       # preserved from prior run
+    assert roes["2025"] == pytest.approx(94.0 / 64.0)  # newly fetched
+    assert set(roes) == {"2021", "2022", "2023", "2024", "2025"}
+    assert cache["AAPL"]["roe_by_year"]["2021"] == 1.11  # persisted to cache
 
 
 def test_fresh_cache_skips_network(monkeypatch):
@@ -110,6 +128,25 @@ def test_symbols_are_normalized_and_deduped(monkeypatch):
     cache = {}
     out = fetch_fundamentals(["BRKB", "BRK-B"], cache, ttl_hours=24)
     assert list(out.keys()) == ["BRK-B"]
+
+
+def test_is_empty_fundamentals():
+    from portfolio.market.yfinance_client import StockFundamentals, is_empty_fundamentals
+
+    blank = StockFundamentals(
+        symbol="SFGYY", pe_ratio=None, dividend_yield=None, roe_current=None,
+        roe_by_year={}, net_income=None, book_value=None, fetched_at="x",
+    )
+    assert is_empty_fundamentals(blank) is True
+
+    # any single populated field makes it non-empty
+    assert is_empty_fundamentals(dataclasses_replace(blank, pe_ratio=10.0)) is False
+    assert is_empty_fundamentals(dataclasses_replace(blank, roe_by_year={"2025": 0.1})) is False
+
+
+def dataclasses_replace(obj, **changes):
+    import dataclasses
+    return dataclasses.replace(obj, **changes)
 
 
 # ---------------------------------------------------------------------------

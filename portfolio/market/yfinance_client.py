@@ -25,10 +25,12 @@ class StockFundamentals:
     pe_ratio: float | None
     dividend_yield: float | None  # yfinance raw value (a fraction, e.g. 0.0055)
     roe_current: float | None  # info["returnOnEquity"] (trailing 12mo)
-    roe_1y: float | None       # most recent fiscal year (from statements)
-    roe_2y: float | None
-    roe_3y: float | None
-    roe_4y: float | None
+    # ROE keyed by fiscal period-end CALENDAR YEAR (string keys for JSON), e.g.
+    # {"2025": 0.16, "2024": 0.14}. yfinance yields ~4 years per fetch; this dict
+    # ACCUMULATES forward across runs (fetch_fundamentals merges), so it can grow
+    # toward the 10 years the sheet is provisioned for. Older years persist even
+    # after they drop out of yfinance's window.
+    roe_by_year: dict
     net_income: float | None   # latest annual Net Income
     book_value: float | None   # latest annual Stockholders Equity
     fetched_at: str            # ISO datetime string
@@ -73,7 +75,10 @@ def _is_fresh(entry: dict, ttl_hours: int) -> bool:
 
 def _from_cache(entry: dict) -> StockFundamentals:
     """Rebuild from a cache dict, tolerating missing/extra keys."""
-    return StockFundamentals(**{name: entry.get(name) for name in _CACHE_FIELDS})
+    data = {name: entry.get(name) for name in _CACHE_FIELDS}
+    if not isinstance(data.get("roe_by_year"), dict):
+        data["roe_by_year"] = {}
+    return StockFundamentals(**data)
 
 
 def _empty(symbol: str) -> StockFundamentals:
@@ -83,13 +88,27 @@ def _empty(symbol: str) -> StockFundamentals:
         pe_ratio=None,
         dividend_yield=None,
         roe_current=None,
-        roe_1y=None,
-        roe_2y=None,
-        roe_3y=None,
-        roe_4y=None,
+        roe_by_year={},
         net_income=None,
         book_value=None,
         fetched_at=_now_iso(),
+    )
+
+
+def is_empty_fundamentals(f: StockFundamentals) -> bool:
+    """True when yfinance returned nothing usable for this symbol.
+
+    Lets the runner surface symbols that came back blank (e.g. a brand-new spinoff
+    ADR not yet indexed by Yahoo) into the Run Log, instead of silently writing an
+    all-empty Stock Metrics row.
+    """
+    return (
+        f.pe_ratio is None
+        and f.dividend_yield is None
+        and f.roe_current is None
+        and f.net_income is None
+        and f.book_value is None
+        and not f.roe_by_year
     )
 
 
@@ -97,17 +116,15 @@ def _fetch_one(symbol: str) -> StockFundamentals:
     """Pull one symbol's fundamentals from yfinance. May raise on network error."""
     ticker = _ticker(symbol)
     info = ticker.info or {}
-    net_income, book_value, roes = roe_history(ticker.financials, ticker.balance_sheet)
-    roe_1y, roe_2y, roe_3y, roe_4y = (roes + [None, None, None, None])[:4]
+    net_income, book_value, roe_by_year = roe_history(
+        ticker.financials, ticker.balance_sheet
+    )
     return StockFundamentals(
         symbol=symbol,
         pe_ratio=info.get("trailingPE"),
         dividend_yield=info.get("dividendYield"),
         roe_current=info.get("returnOnEquity"),
-        roe_1y=roe_1y,
-        roe_2y=roe_2y,
-        roe_3y=roe_3y,
-        roe_4y=roe_4y,
+        roe_by_year={str(year): value for year, value in roe_by_year.items()},
         net_income=net_income,
         book_value=book_value,
         fetched_at=_now_iso(),
@@ -143,6 +160,12 @@ def fetch_fundamentals(
             logger.warning("yfinance fetch failed for %s: %s", symbol, exc)
             results[symbol] = _from_cache(entry) if entry is not None else _empty(symbol)
             continue
+        # Accumulate ROE history by calendar year: prior cached years persist even
+        # after they fall out of yfinance's ~4-year window; freshly fetched years
+        # win on collision. This is how the cache grows toward the sheet's 10 years.
+        prior = entry.get("roe_by_year") if isinstance(entry, dict) else None
+        if isinstance(prior, dict):
+            fundamentals.roe_by_year = {**prior, **fundamentals.roe_by_year}
         cache[symbol] = dataclasses.asdict(fundamentals)
         results[symbol] = fundamentals
 
