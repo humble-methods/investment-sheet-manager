@@ -8,16 +8,25 @@ layer directly.
 
 from collections.abc import Iterable
 
-from portfolio.config import CASH_CUSIPS, CASH_SYMBOLS, SYMBOL_OVERRIDES
+from portfolio.config import (
+    CASH_CUSIPS,
+    CASH_SYMBOLS,
+    SYMBOL_OVERRIDES,
+    TICKER_RENAMES,
+)
 
 
 def normalize_symbol(raw: str) -> str:
-    """Merrill ticker -> yfinance ticker (e.g. "BRKB" -> "BRK-B").
+    """Merrill ticker -> canonical yfinance ticker (e.g. "BRKB" -> "BRK-B").
 
-    Idempotent: already-normalized symbols pass through unchanged, so it is safe
-    to call on held-position symbols that were normalized at parse time.
+    Two-stage: first apply a ticker RENAME (old ticker -> current ticker, for
+    corporate actions like ATGE -> CVSA) so bootstrap lots and later activity
+    unify; then apply the Merrill-vs-Yahoo SPELLING override. Idempotent —
+    already-normalized symbols pass through unchanged, so it is safe to call on
+    held-position symbols that were normalized at parse time.
     """
     raw = raw.strip()
+    raw = TICKER_RENAMES.get(raw, raw)
     return SYMBOL_OVERRIDES.get(raw, raw)
 
 
