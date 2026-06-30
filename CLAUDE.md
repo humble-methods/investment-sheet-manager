@@ -249,10 +249,13 @@ All symbol normalization lives in `portfolio/market/symbol_overrides.py`.
 ### Ticker Renames / Corporate Actions
 When a security **changes tickers** (e.g. `ATGE` → `CVSA`, Adtalem Global Education →
 Covista), the bootstrap lots carry the OLD ticker while later activity uses the NEW one.
-Map old → new in `config.TICKER_RENAMES` so both unify into a single symbol for FIFO lot
-matching + yfinance. Applied **before** `SYMBOL_OVERRIDES` in `normalize_symbol`. Distinct
-from `SYMBOL_OVERRIDES`, which only fixes the Merrill-vs-Yahoo *spelling* of the SAME
-current ticker. (Mergers/splits with share changes are NOT covered by this — see Non-Obvious
+`config.TICKER_RENAMES` maps the old ticker to a structured **`CorporateAction`** record
+(`new_symbol`, `kind`, `note`) — **not** a bare new-ticker string — so the registry can
+carry the action's context now and ratios/effective dates later (Phase 19) without reshaping
+call sites. `normalize_symbol` reads `action.new_symbol` to unify both into a single symbol
+for FIFO lot matching + yfinance. Applied **before** `SYMBOL_OVERRIDES`. Distinct from
+`SYMBOL_OVERRIDES`, which only fixes the Merrill-vs-Yahoo *spelling* of the SAME current
+ticker. (Mergers/splits with share changes are NOT covered by this — see Non-Obvious
 Behaviors #26 and BUILD_PLAN Phase 19.)
 
 | Old Ticker | Current Ticker | Notes |
@@ -538,7 +541,7 @@ Dropdowns + a frozen header/label are applied via the raw Sheets API (`sh.batch_
 
 24. **ROE history accumulates by calendar year across runs**: yfinance returns only ~4 annual columns per fetch, but Stock Metrics is provisioned for 10 years. The cache (`yfinance_cache.json`) stores `roe_by_year` keyed by the fiscal period-end's **calendar year** (string keys), and `fetch_fundamentals` **merges** each run's freshly-fetched years into the prior cached dict (fresh wins on collision) — older years persist even after they drop out of yfinance's window, so the cache grows toward 10 years over time. Two consequences: (a) **never replace the cached `roe_by_year` wholesale** on a fresh fetch — that destroys accumulated history; (b) sheet columns are **relative** (`ROE (NY Ago)`), mapped at write time by `year == run_year − N`, so blanks beyond ~4Y now self-fill on future runs. ROE pairs income/equity **by year**, not by column position. Guards: `test_roe_history_keyed_by_calendar_year`, `test_roe_history_accumulates_old_years_across_runs`, `test_write_stock_metrics_roe_relative_year_columns`.
 
-25. **Ticker renames cause a FIFO oversell if unmapped**: a security that changed tickers (a corporate action) arrives as bootstrap `INIT_BUY` lots under the OLD ticker but as `SELL` activity under the NEW ticker. `build_lots` matches lots by **exact symbol**, so the SELL finds zero lots and raises `Oversell: SELL of N <NEW> ... exceeds available lots`. Fix by adding `old → new` to `config.TICKER_RENAMES` (applied in `normalize_symbol`, so BOTH parsers unify the symbol at ingest — and `normalize_all` collapses any stale OLD rows already on the Transactions tab). This also explains a symbol "missing from yfinance": the old ticker is dead; the live one is the new symbol. First case: `ATGE → CVSA`. Guards: `test_normalize_applies_ticker_rename`, `test_renamed_ticker_sell_depletes_bootstrap_lots`.
+25. **Ticker renames cause a FIFO oversell if unmapped**: a security that changed tickers (a corporate action) arrives as bootstrap `INIT_BUY` lots under the OLD ticker but as `SELL` activity under the NEW ticker. `build_lots` matches lots by **exact symbol**, so the SELL finds zero lots and raises `Oversell: SELL of N <NEW> ... exceeds available lots`. Fix by adding `old → CorporateAction(new_symbol=…)` to `config.TICKER_RENAMES` (applied in `normalize_symbol`, so BOTH parsers unify the symbol at ingest — and `normalize_all` collapses any stale OLD rows already on the Transactions tab). This also explains a symbol "missing from yfinance": the old ticker is dead; the live one is the new symbol. First case: `ATGE → CVSA`. Guards: `test_normalize_applies_ticker_rename`, `test_renamed_ticker_sell_depletes_bootstrap_lots`.
 
 26. **Unmapped `(Type, Description 1)` combos are silently dropped from holdings**: the activity parser tags any combo not in `TX_TYPE_MAP` as `tx_type="UNKNOWN"` (logged, not raised) and `build_lots` ignores everything but BUY/INIT_BUY/SELL — so the row is kept in Transactions but has **zero effect on share counts or cash**. This is fine for true non-events, but real share/cash-moving types currently fall through this crack: **`SecurityTransactions / Stock Dividend Due Bill`** and **`SecurityTransactions / Dividend`** with a share quantity (stock dividends / splits — e.g. KLAC +306 on 34 sh ≈ 10-for-1, VGT +70 on 10 ≈ 8-for-1, in the 04–06/2026 file), plus **`FundTransfers / Funds Received`** (inbound cash) and **`FundReceipts / Current Year Contribution`** (Roth contribution). Effect: holdings **understate** post-split quantities (and it's a latent oversell next period if those shares are sold), and the Cash tab misses transfers. Handling these is **not yet built** — tracked in BUILD_PLAN Phase 19.
 

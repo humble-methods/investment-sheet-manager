@@ -1087,13 +1087,15 @@ python3 -m pytest tests/test_fundamentals.py tests/test_yfinance_client.py tests
 the post-rename SELL doesn't oversell. **Status: built.**
 
 ### Deliverables
-- `portfolio/config.py` (`TICKER_RENAMES`, seeded `ATGE → CVSA`)
+- `portfolio/models.py` (`CorporateAction` dataclass — structured rename record)
+- `portfolio/config.py` (`TICKER_RENAMES: dict[str, CorporateAction]`, seeded `ATGE → CVSA`)
 - `portfolio/market/symbol_overrides.py` (`normalize_symbol` applies `TICKER_RENAMES` BEFORE `SYMBOL_OVERRIDES`)
 - `tests/test_symbol_overrides.py`, `tests/test_fifo.py`
 
 ### Approach
+- Corporate-action normalization maps to a **structured `CorporateAction`** (`new_symbol`, `kind`, `note`), not a bare old→new string — extensible to splits/mergers (ratios, effective dates) in Phase 19 without reshaping call sites.
 - `normalize_symbol` is the single chokepoint both parsers use via `clean_symbol`, so a rename there unifies bootstrap `INIT_BUY` lots and later activity at ingest. `normalize_all` then collapses any stale OLD ticker still on the Transactions tab, so yfinance fetches only the live ticker.
-- Two-stage: rename (old→current) first, then Merrill→Yahoo spelling override — a renamed ticker can still get a spelling fix.
+- Two-stage: rename (old→current, via `action.new_symbol`) first, then Merrill→Yahoo spelling override — a renamed ticker can still get a spelling fix.
 
 ### Tests
 `normalize_symbol("ATGE") == "CVSA"`; rename-then-spelling chaining; `normalize_all` collapses old+new to one; FIFO regression — INIT_BUY under old ticker + full SELL under new ticker depletes cleanly (reproduces the reported `Oversell` crash).

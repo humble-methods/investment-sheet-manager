@@ -19,10 +19,22 @@ def test_normalize_applies_ticker_rename():
 def test_rename_then_spelling_override(monkeypatch):
     # A renamed ticker must still pick up a Merrill->Yahoo spelling fix afterward.
     from portfolio.market import symbol_overrides as so
+    from portfolio.models import CorporateAction
 
-    monkeypatch.setattr(so, "TICKER_RENAMES", {"OLD": "BRKB"})
+    monkeypatch.setattr(so, "TICKER_RENAMES", {"OLD": CorporateAction(new_symbol="BRKB")})
     monkeypatch.setattr(so, "SYMBOL_OVERRIDES", {"BRKB": "BRK-B"})
     assert so.normalize_symbol("OLD") == "BRK-B"
+
+
+def test_ticker_renames_maps_to_corporate_action():
+    # Corporate-action normalization is a structured map, not bare old->new strings.
+    from portfolio.config import TICKER_RENAMES
+    from portfolio.models import CorporateAction
+
+    action = TICKER_RENAMES["ATGE"]
+    assert isinstance(action, CorporateAction)
+    assert action.new_symbol == "CVSA"
+    assert action.kind == "rename"
 
 
 def test_normalize_all_collapses_renamed_and_current_ticker():

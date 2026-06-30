@@ -2,6 +2,8 @@
 
 import os
 
+from portfolio.models import CorporateAction
+
 # Ticker normalization: Merrill symbol -> yfinance symbol (same security, different
 # spelling — Merrill's vs. Yahoo's). Applied AFTER TICKER_RENAMES.
 SYMBOL_OVERRIDES: dict[str, str] = {
@@ -9,15 +11,20 @@ SYMBOL_OVERRIDES: dict[str, str] = {
 }
 
 # Ticker renames / corporate actions: a security that CHANGED tickers over time.
-# Maps the OLD ticker to its CURRENT ticker so historical bootstrap lots and new
-# activity unify into one symbol for FIFO lot matching + yfinance lookups — without
-# this, a SELL under the new ticker oversells (no lots exist under it). Distinct from
-# SYMBOL_OVERRIDES, which only fixes the Merrill-vs-Yahoo spelling of the SAME ticker.
-# Applied BEFORE SYMBOL_OVERRIDES so a renamed ticker can still get a spelling fix.
-TICKER_RENAMES: dict[str, str] = {
-    # Adtalem Global Education renamed to Covista Inc (CUSIP 00737L103). 84 sh held
-    # at bootstrap as ATGE in 53X-69S37, later sold as CVSA on 2026-06-03.
-    "ATGE": "CVSA",
+# Maps the OLD ticker to a structured CorporateAction (NOT a bare new-ticker string)
+# so the registry can carry the action's kind/context now and ratios/effective dates
+# later (Phase 19) without reshaping call sites. Unifying old + new lets historical
+# bootstrap lots and new activity share one symbol for FIFO lot matching + yfinance —
+# without it, a SELL under the new ticker oversells (no lots exist under it). Distinct
+# from SYMBOL_OVERRIDES, which only fixes the Merrill-vs-Yahoo spelling of the SAME
+# ticker. Applied BEFORE SYMBOL_OVERRIDES so a renamed ticker can still get a spelling fix.
+TICKER_RENAMES: dict[str, CorporateAction] = {
+    # 84 sh held at bootstrap as ATGE in 53X-69S37, later sold as CVSA on 2026-06-03.
+    "ATGE": CorporateAction(
+        new_symbol="CVSA",
+        kind="rename",
+        note="Adtalem Global Education -> Covista Inc (CUSIP 00737L103)",
+    ),
 }
 
 # Skip these from equity processing (cash/money market)

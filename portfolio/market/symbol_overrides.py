@@ -26,7 +26,9 @@ def normalize_symbol(raw: str) -> str:
     held-position symbols that were normalized at parse time.
     """
     raw = raw.strip()
-    raw = TICKER_RENAMES.get(raw, raw)
+    action = TICKER_RENAMES.get(raw)
+    if action is not None:
+        raw = action.new_symbol
     return SYMBOL_OVERRIDES.get(raw, raw)
 
 

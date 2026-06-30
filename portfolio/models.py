@@ -75,6 +75,22 @@ class CashBalance:
         return round(self.reconstructed - self.snapshot, 2)
 
 
+@dataclass(frozen=True)
+class CorporateAction:
+    """A corporate action that remaps an OLD ticker onto a current one.
+
+    A structured record rather than a bare ``old -> new`` string, because a
+    corporate action carries more than a target symbol (its kind, context, and —
+    for future actions like splits/mergers — ratios or effective dates). Today only
+    ``new_symbol`` drives normalization (see ``normalize_symbol``); ``kind`` and
+    ``note`` document the event. Extend this dataclass (not the call sites) when
+    Phase 19 adds share-changing actions.
+    """
+    new_symbol: str          # current ticker the old symbol maps to
+    kind: str = "rename"     # "rename" | "merger" (split/stock-dividend → Phase 19)
+    note: str = ""           # human context (e.g. company names, CUSIP)
+
+
 @dataclass
 class RunLogEntry:
     run_timestamp: str
