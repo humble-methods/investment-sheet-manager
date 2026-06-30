@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
+from portfolio.metrics.pricing import close_on_or_before
 from portfolio.models import Transaction
 
 _BUY_TYPES = {"BUY", "INIT_BUY"}
@@ -143,18 +144,9 @@ def modified_dietz(
     return (end_value - begin_value - net_flow + income) / base
 
 
-def _close_on_or_before(history, as_of: date) -> float | None:
-    """Last weekly close on/before ``as_of`` from a PriceHistory-like object."""
-    if history is None:
-        return None
-    cutoff = as_of.isoformat()
-    best = None
-    for d, c in zip(history.dates, history.closes):
-        if d <= cutoff:
-            best = c
-        else:
-            break  # dates are ascending
-    return best
+# Year-boundary valuations share the Price History anniversary lookup. Private
+# alias keeps the existing call sites + regression tests stable.
+_close_on_or_before = close_on_or_before
 
 
 # ---------------------------------------------------------------------------

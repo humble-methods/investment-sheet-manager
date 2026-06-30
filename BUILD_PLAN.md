@@ -951,28 +951,11 @@ python3 -m pytest -q   # full suite green
 
 ---
 
-## Phase 12 — Composition Tab (current value weight)
-**Goal:** A per-symbol snapshot of market-value weight vs cost-basis weight (+ delta), cash as its own slice, consolidated + per-account, as a data table the user charts once.
-
-### Deliverables
-- `portfolio/metrics/composition.py` (`composition_rows`, `CompositionRow`)
-- `portfolio/sheets/writer.py` (`write_composition`, `TAB_COMPOSITION`, `COMPOSITION_HEADERS`)
-- `portfolio/config.py` (`COMPOSITION_OTHER_THRESHOLD = 0.015`)
-- `portfolio/runner.py` (step 18b)
-- `tests/test_composition.py`, `tests/test_writer.py`
-
-### Approach
-- Pure `composition_rows(positions, latest_close, cash_balances, threshold)` → rows per scope (`ALL` first, then each account). `market_value = qty × latest_close` (latest close from the run's `PriceHistory`); cost from `Position.total_cost_basis`; cash slice = reconstructed balance.
-- Equities below `COMPOSITION_OTHER_THRESHOLD` of scope market weight collapse into `Other`; **cash is never bucketed**. Weights are fractions; `Weight Delta = Market Weight − Cost Weight`.
-- Headers Title Case, **`As Of Date` last** (Phase 9 convention). Symbol (col B) beside Market Value (col C) for one-range pie selection.
-
-### Tests
-Weights sum to 1 per scope; `Other` bucketing; cash slice present + unbucketed; delta = market − cost; consolidated vs per-account; missing-price → 0 market value (no crash).
-
-### Validation
-```bash
-python3 -m pytest tests/test_composition.py tests/test_writer.py -q
-```
+## Phase 12 — Composition Tab (REMOVED)
+**Status:** Removed after the first build. Market-value vs cost-basis weighting is better done with the
+sheet's own pivot/chart tooling than a Python-maintained data tab. Deleted `portfolio/metrics/composition.py`,
+`write_composition` + `TAB_COMPOSITION`/`COMPOSITION_HEADERS`, `COMPOSITION_OTHER_THRESHOLD`,
+`tests/test_composition.py`, and runner step 18b. May return later as a sheet-native view.
 
 ---
 
@@ -989,6 +972,7 @@ python3 -m pytest tests/test_composition.py tests/test_writer.py -q
 - **Lifetime = annualized XIRR** (Newton + bisection fallback, no scipy): buys/sells at `tx.amount`, dividends (total only), terminal = current value. **Per-year = non-annualized Modified Dietz** (avoids partial-year annualization blow-up). `Income = total − price`.
 - Per symbol consolidated across accounts + a pooled `PORTFOLIO` row (invested-sleeve XIRR; not whole-account — sidesteps Decision 19). Total leg nets ADR fees + foreign withholding.
 - Per-year begin/end values = year-boundary shares (`positions_as_of(Dec 31)`) × year-end weekly close from `PriceHistory`; reuses the **same filtered txn set** as Holdings (no double counting).
+- **Presentation:** these two tabs are **backing data** only; the interactive side-by-side view is the new `Performance Compare` tab (Phase 16). Computation here is unchanged (calendar-year Modified Dietz), fed by the 5-yr weekly series now retained in the Drive cache (Phase 15).
 
 ### Tests
 `xirr` known IRRs + sign edge cases → None; `modified_dietz` closed-form + time-weighting; `lifetime_cashflows` total vs price (fee netting); `year_returns` extraction; `positions_as_of` mid-year buy/sell at a year boundary; `build_performance` integration (chained year values, PORTFOLIO row).
@@ -1003,29 +987,62 @@ Per-year coverage is bounded by the 5-yr price-history window; pre-cutoff divide
 
 ---
 
-## Phase 14 — Opportunity Cost of Idle Cash (nice-to-have)
-**Goal:** Quantify the cost of holding idle cash vs the portfolio's own return — dollars left on the table + the bps haircut to blended return. Depends on Phase 13.
+## Phase 14 — Opportunity Cost of Idle Cash (REMOVED)
+**Status:** Removed after the first build — the idle-cash-drag framing wasn't as exhaustive/useful as hoped
+and needs rethinking. Deleted `portfolio/metrics/opportunity.py`, `engine/cash.py::cash_balance_series`,
+`write_opportunity_cost` + tab/headers, `tests/test_opportunity.py` (+ its `test_cash.py` cases), and runner
+step 18d. `reconstruct_cash` and the Cash tab are untouched. To be re-evaluated.
+
+---
+
+## Phase 15 — Price History → anniversary snapshots, symbols as rows
+**Goal:** Replace the wide weekly Price History tab (one column per symbol, ~260 date rows) with a compact
+**one-row-per-symbol** view of anniversary closes (Today, 1Y–5Y Ago). The full weekly series stays in the
+Drive cache for the Performance year-boundary math.
 
 ### Deliverables
-- `portfolio/engine/cash.py` (`cash_balance_series` — new; `reconstruct_cash` untouched)
-- `portfolio/metrics/opportunity.py` (`time_weighted_average`, `build_opportunity`, `OpportunityCost`)
-- `portfolio/sheets/writer.py` (`write_opportunity_cost` + tab/headers)
-- `portfolio/runner.py` (step 18d), `tests/test_opportunity.py`, `tests/test_cash.py`, `tests/test_writer.py`
+- `portfolio/metrics/pricing.py` (NEW; `close_on_or_before`, `anniversary`) — shared, dependency-light (stdlib only).
+- `portfolio/metrics/performance.py` (`_close_on_or_before` now aliases the shared helper).
+- `portfolio/sheets/writer.py` (`write_price_history` reshaped; `PRICE_HISTORY_HEADERS`).
+- `tests/test_pricing.py` (NEW), `tests/test_writer.py`.
 
 ### Approach
-- `cash_balance_series` replays the sweep model into per-account `[(date, balance)]`; `time_weighted_average` → avg idle cash over `[init_date, today]`.
-- `r_inv` = PORTFOLIO lifetime total XIRR (Phase 13); `r_cash` = Bank Interest / avg cash, annualized. `Opportunity Cost ($) = avg idle cash × (r_inv − r_cash) × years`; `Cash Drag = cash_weight × (r_inv − r_cash)`. Consolidated (`ALL`) + per-account.
+- yfinance fetch + `price_history_cache.json` **unchanged** (still 5-yr weekly) — only the *tab* changes.
+- Per symbol (sorted): write `Symbol | Today | 1Y Ago | … | 5Y Ago`, each = `close_on_or_before(history, anniversary(today, k))`. Blank where the symbol lacks history that far back. `anniversary` = `today.replace(year=today.year − k)` with a Feb 29 → Feb 28 fallback.
+- `write_price_history(sh, histories, today=None)` gains `today` for deterministic tests.
 
 ### Tests
-`time_weighted_average` constant / step / zero-window; `cash_balance_series` opening + steps, equity rows excluded, matches `reconstruct_cash`; `build_opportunity` cost/drag signs, ALL aggregation, None-portfolio-return blanks.
+`close_on_or_before` last-on-or-before + None/empty; `anniversary` basic + leap-day; `write_price_history` one row per symbol, correct anniversary picks, blanks for short history, header-only when empty.
 
 ### Validation
 ```bash
-python3 -m pytest tests/test_opportunity.py tests/test_cash.py -q
+python3 -m pytest tests/test_pricing.py tests/test_writer.py -q
 ```
 
-### Caveat
-Dollar figures inherit the unvalidated sweep cash model (Decision 19) + a Bank-Interest-only cash yield — surfaced in the `Note` column.
+---
+
+## Phase 16 — Performance Compare (interactive side-by-side cards)
+**Goal:** Replace "all symbols listed at once" with a **sheet-driven** comparison: pick a few symbols and see
+their lifetime + per-year metrics as side-by-side cards. Computation stays in Python; interaction lives in the sheet.
+
+### Deliverables
+- `portfolio/sheets/writer.py` (`write_performance_compare`, `_performance_compare_grid`, `_compare_lifetime_formula`, `_compare_year_formula`, `_apply_compare_dropdowns`, `TAB_PERFORMANCE_COMPARE`, `PERFORMANCE_COMPARE_SLOTS = 5`, `PERFORMANCE_COMPARE_YEARS = 6`).
+- `portfolio/runner.py` (step 18b, after the Performance data tabs).
+- `tests/test_writer.py`.
+
+### Approach
+- **Backing data** = the existing `Performance` (lifetime) + `Performance By Year` (long) tabs, rewritten each run.
+- **Presentation** = a scaffolded tab: col A metric labels; row-1 cols B… are fixed **single-select dropdown slots** sourced from `=Performance!$A$2:$A`. Lifetime rows `VLOOKUP` the Performance tab; per-year rows `INDEX/MATCH` Performance By Year on a `symbol|year` key built inline with `ARRAYFORMULA`. Year rows are `YEAR(TODAY())`-relative so they self-update.
+- **Set-up-once:** `write_performance_compare` no-ops if the tab exists (never clobbers the user's picks); cards refresh live because they're formulas. Dropdowns + frozen header/label applied via `sh.batch_update` (`setDataValidation` `ONE_OF_RANGE`).
+- **Decisions:** calendar-year (not trailing) per-period returns; fixed dropdown slots (not multi-select) — the Sheets API can't create true multi-select "chip" dropdowns (UI-only).
+
+### Tests
+Scaffolds when absent (grid: label col, blank slots, VLOOKUP lifetime rows, `YEAR(TODAY())` year rows); sets `ONE_OF_RANGE` validation over the N slots; **idempotent** no-op when the tab already exists.
+
+### Validation
+```bash
+python3 -m pytest tests/test_writer.py -q
+```
 
 ---
 
@@ -1046,9 +1063,11 @@ Post-MVP enhancements (sequence by dependency, not number):
 Phase 9 (Human headers, dedup-safe reads)
     └── Phase 10 (Metrics scope + Watchlist)  ← uses Phase 9's TRANSACTIONS_KEYS reads
             └── Phase 11 (5-yr Price History)  ← consumes Phase 10's symbol set
-                    ├── Phase 12 (Composition)          ← + holdings + cash
-                    └── Phase 13 (Performance)          ← + FIFO as-of + transactions
-                            └── Phase 14 (Opportunity Cost)  ← nice-to-have; + cash series
+                    ├── Phase 12 (Composition)       ← REMOVED (use native sheet charts)
+                    ├── Phase 13 (Performance)       ← + FIFO as-of + transactions (backing data)
+                    │       └── Phase 16 (Performance Compare)  ← interactive cards on Phase 13's tabs
+                    ├── Phase 14 (Opportunity Cost)  ← REMOVED (re-evaluate)
+                    └── Phase 15 (Price History reshape)  ← anniversary snapshots, rows = symbols
 Phase 8 (Hardening) is orthogonal — do it before or after 9–11.
 ```
 

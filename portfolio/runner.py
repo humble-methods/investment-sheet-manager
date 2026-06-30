@@ -11,7 +11,6 @@ from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
 
-from portfolio.config import COMPOSITION_OTHER_THRESHOLD
 from portfolio.drive.archiver import (
     build_drive_service,
     download_csv,
@@ -25,7 +24,7 @@ from portfolio.drive.archiver import (
     save_price_history_cache,
     save_yfinance_cache,
 )
-from portfolio.engine.cash import cash_balance_series, reconcile_cash, reconstruct_cash
+from portfolio.engine.cash import reconcile_cash, reconstruct_cash
 from portfolio.engine.holdings import (
     compute_holdings,
     filter_and_partition,
@@ -34,9 +33,7 @@ from portfolio.engine.holdings import (
 )
 from portfolio.market.symbol_overrides import normalize_all
 from portfolio.market.yfinance_client import fetch_fundamentals, fetch_price_history
-from portfolio.metrics.composition import composition_rows
-from portfolio.metrics.opportunity import build_opportunity
-from portfolio.metrics.performance import PORTFOLIO, build_performance
+from portfolio.metrics.performance import build_performance
 from portfolio.models import RunLogEntry, Transaction
 from portfolio.parsers.activity_parser import parse_activity_csv
 from portfolio.parsers.holdings_parser import parse_holdings_csv
@@ -49,11 +46,10 @@ from portfolio.sheets.writer import (
     load_recorded_symbols,
     load_watchlist_symbols,
     write_cash,
-    write_composition,
     write_holdings,
-    write_opportunity_cost,
     write_performance,
     write_performance_by_year,
+    write_performance_compare,
     write_price_history,
     write_run_log,
     write_stock_metrics,
@@ -273,16 +269,9 @@ def run_update(credentials=None) -> None:
     write_stock_metrics(sh, fundamentals, date.today())
     write_price_history(sh, histories)
 
-    # --- 18b. Composition (current value weight vs cost weight) ---
-    latest_close = {sym: h.closes[-1] for sym, h in histories.items() if h.closes}
-    composition = composition_rows(
-        positions, latest_close, cash_balances, COMPOSITION_OTHER_THRESHOLD
-    )
-    write_composition(sh, composition, date.today())
-    print(f"Composition: {len(composition)} row(s)")
-
-    # --- 18c. Performance (lifetime XIRR + per-year Modified Dietz, total & price) ---
+    # --- 18b. Performance (lifetime XIRR + per-year Modified Dietz, total & price) ---
     today = date.today()
+    latest_close = {sym: h.closes[-1] for sym, h in histories.items() if h.closes}
     kept_txns, _ = filter_and_partition(all_transactions, account_state)
     txns_by_symbol: dict[str, list[Transaction]] = defaultdict(list)
     for tx in kept_txns:
@@ -307,22 +296,8 @@ def run_update(credentials=None) -> None:
     )
     write_performance(sh, perf_summaries, today)
     write_performance_by_year(sh, perf_yearly, today)
+    write_performance_compare(sh)  # set-up-once interactive comparison tab
     print(f"Performance: {len(perf_summaries)} symbol row(s), {len(perf_yearly)} year row(s)")
-
-    # --- 18d. Opportunity cost of idle cash (nice-to-have) ---
-    cash_series = cash_balance_series(all_transactions, bootstrap_cash, account_state)
-    invested_by_account: dict[str, float] = defaultdict(float)
-    for p in positions:
-        invested_by_account[p.account_number] += p.quantity * (latest_close.get(p.symbol) or 0.0)
-    portfolio_return = next(
-        (s.lifetime_total_xirr for s in perf_summaries if s.symbol == PORTFOLIO), None
-    )
-    opportunity = build_opportunity(
-        account_state, cash_series, kept_txns, portfolio_return,
-        dict(invested_by_account), today,
-    )
-    write_opportunity_cost(sh, opportunity, today)
-    print(f"Opportunity cost: {len(opportunity)} scope row(s)")
 
     # --- 19. Save updated account_state ---
     save_account_state(service, cache_id, account_state)

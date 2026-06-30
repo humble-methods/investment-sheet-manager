@@ -278,11 +278,9 @@ Merrill uses standard US ticker symbols for ADRs (`IX`, `TM`, `LYG`, `TSM`, etc.
 | `Holdings` | Current position summary per account. Derived by replaying Transactions. |
 | `Cash` | Per-account cash (CMA sweep 990156937 / Roth IIAXX): reconstructed vs snapshot + drift. |
 | `Stock Metrics` | Fundamentals + ROE per ticker for **every recorded symbol (held or since sold) + Watchlist**. Current price via GOOGLEFINANCE; fundamentals via yfinance. |
-| `Price History` | 5-year weekly closing prices (yfinance, Python-fetched values). One column per symbol on a shared `Date` axis. |
-| `Composition` | Market-value weight vs cost-basis weight (+ delta) per symbol, cash as its own slice; consolidated (`ALL`) + per-account. Data-only — insert a pie chart once. |
-| `Performance` | Lifetime annualized money-weighted return (XIRR) per symbol — total (dividends in) + price (out) + income contribution — plus a pooled `PORTFOLIO` row. |
-| `Performance By Year` | Per-(symbol, year) calendar-year return (non-annualized Modified Dietz), total + price. Long format for charting. |
-| `Opportunity Cost` | Idle-cash drag vs the portfolio return (dollars left on the table + bps haircut), consolidated + per-account. Nice-to-have; inherits the sweep cash model (Decision 19). |
+| `Price History` | Anniversary closing-price snapshots (Today, 1Y–5Y Ago) — one **row per symbol** (yfinance, Python-fetched values). |
+| `Performance` | Lifetime annualized money-weighted return (XIRR) per symbol — total (dividends in) + price (out) + income contribution — plus a pooled `PORTFOLIO` row. **Backing data for `Performance Compare`.** |
+| `Performance By Year` | Per-(symbol, year) calendar-year return (non-annualized Modified Dietz), total + price. Long format; **backing data for `Performance Compare`.** |
 | `Run Log` | One row per run: timestamp, files processed, errors, holdings delta, skipped accounts, cash reconciliation. |
 
 **Editable tabs (human-maintained):**
@@ -290,6 +288,7 @@ Merrill uses standard US ticker symbols for ADRs (`IX`, `TM`, `LYG`, `TSM`, etc.
 | Tab | Description |
 |-----|-------------|
 | `Watchlist` | Tickers to track even if not held. **Read each run** and unioned into Stock Metrics + Price History. Single `Symbol` column; auto-created if missing, never overwritten. |
+| `Performance Compare` | Side-by-side per-symbol comparison. Fixed single-select dropdown slots (row 1) pick symbols; formulas below pull lifetime + per-year metrics from the `Performance` / `Performance By Year` tabs. **Scaffolded once, then never overwritten** — dropdown picks persist; cards self-refresh as the data tabs update. |
 
 Note: configuration (Drive folder IDs, spreadsheet ID, toggles) lives in `portfolio/config.py`,
 not a Settings tab — keep operational config in code. Per-account init dates are runtime state
@@ -324,22 +323,18 @@ Covers **every recorded symbol (held or sold) + Watchlist**. Python writes (from
 `Symbol | P/E Ratio | Dividend Yield | ROE (Current) | ROE (1Y Ago) | ROE (2Y Ago) | ROE (3Y Ago) | ROE (4Y Ago) | Net Income | Book Value | Current Price | As Of Date`
 
 - Current Price is a GOOGLEFINANCE formula (symbol in col A): `=IFERROR(GOOGLEFINANCE(A2, "price"), "N/A")`
-- The 52-week high/low columns were **removed**; 5-year history now lives on the Price History tab.
+- The 52-week high/low columns were **removed**; price history now lives on the Price History tab
+  (anniversary snapshots on the tab; full weekly series in the Drive cache).
 
 ### Price History tab
-5-year **weekly closing prices** fetched by Python/yfinance and written as **values** (not formulas):
-`Date | <symbol 1> | <symbol 2> | …` — one row per weekly date on a unified, sorted `Date` axis (the
-union of all symbols' dates; blank where a symbol lacks that week). Symbols sorted alphabetically.
-
-### Composition tab
-`Scope | Symbol | Market Value | Market Weight | Cost Basis | Cost Weight | Weight Delta | As Of Date`
-
-One block per `Scope` (`ALL` consolidated first, then each account number). `Symbol` is a ticker,
-`Other` (sub-threshold equities, `COMPOSITION_OTHER_THRESHOLD` = 1.5%), or `CASH` (never bucketed).
-**Market values use the latest weekly close from Price History (Python), NOT the live GOOGLEFINANCE
-price** — so they can be up to ~1 week stale; the live view stays on Holdings. Weights are fractions
-(0..1); `Weight Delta = Market Weight − Cost Weight`. Symbol (col B) sits beside Market Value (col C)
-so a pie chart selects label+value in one contiguous range.
+**Anniversary closing-price snapshots**, one **row per symbol** (symbols sorted alphabetically), written
+as **values** (not formulas):
+`Symbol | Today | 1Y Ago | 2Y Ago | 3Y Ago | 4Y Ago | 5Y Ago`
+Each value is the latest weekly close **on/before** that anniversary date (so up to ~1 week stale; blank
+if the symbol lacks history that far back). The full 5-yr weekly series is **retained in the Drive cache**
+(`price_history_cache.json`) and still feeds the Performance year-boundary math — this tab is the slimmed
+human-readable view. Anniversary dates: `today.replace(year=today.year − k)` (Feb 29 → Feb 28); the
+lookup (`close_on_or_before`) and `anniversary()` both live in `portfolio/metrics/pricing.py`.
 
 ### Performance tab
 `Symbol | First Held | Current Value | Cost Basis | Lifetime Total XIRR | Lifetime Price XIRR | Income Contribution | As Of Date`
@@ -360,14 +355,17 @@ values = year-boundary shares (`positions_as_of`) × year-end weekly close. Cave
 from each account's bootstrap cutoff forward, so total return slightly understates income for long-held
 bootstrapped lots.
 
-### Opportunity Cost tab
-`Scope | Avg Idle Cash | Avg Total Value | Cash Weight | Portfolio Return | Cash Return | Opportunity Cost ($) | Cash Drag | Window Start | Window Years | Note | As Of Date`
-
-Nice-to-have. One row per `Scope` (`ALL` + each account). Idle cash = time-weighted average reconstructed
-balance over [init_date, today]; `Portfolio Return` = the invested-sleeve PORTFOLIO XIRR; `Cash Return` =
-Bank Interest / avg cash, annualized. `Opportunity Cost ($) = avg idle cash × (portfolio − cash return) ×
-years`; `Cash Drag = Cash Weight × (portfolio − cash return)`. **Dollar figures inherit the unvalidated
-sweep cash model (Decision 19)** and a Bank-Interest-only cash yield — see the `Note` column.
+### Performance Compare tab (interactive)
+Not a flat row schema. **Column A** = metric labels; **row 1, cols B…** = fixed single-select dropdown
+slots (`PERFORMANCE_COMPARE_SLOTS` = 5) sourced from `=Performance!$A$2:$A`. Each slot drives one
+side-by-side card via formulas: lifetime rows `VLOOKUP` the `Performance` tab; per-year rows `INDEX/MATCH`
+the `Performance By Year` tab on a `symbol|year` key built inline with `ARRAYFORMULA`. Year rows are
+`YEAR(TODAY())`-relative (`PERFORMANCE_COMPARE_YEARS` = 6: current + 5 prior) so they self-update with no
+rewrite. **Scaffolded once** — `write_performance_compare` no-ops when the tab already exists, so the
+user's dropdown picks are never clobbered; cards refresh live as the data tabs are rewritten each run.
+Dropdowns + a frozen header/label are applied via the raw Sheets API (`sh.batch_update` →
+`setDataValidation` `ONE_OF_RANGE`). The Sheets API **cannot** create true multi-select "chip" dropdowns
+(UI-only) — convert a slot by hand if you want one; the `SPLIT`-agnostic lookups still work.
 
 ### Run Log tab
 `Run Timestamp | Files Processed | Init Rows Added | Transactions Added | Accounts Skipped | Errors | Holdings Changed | Cash Reconciliation | Duration (Sec) | Notes`
@@ -419,10 +417,10 @@ sweep cash model (Decision 19)** and a Bank-Interest-only cash yield — see the
 - Sells deplete oldest lots first within the same account
 - Holdings recomputed from scratch each run by replaying full transaction history
 
-### Price Data: current via GOOGLEFINANCE, 5-yr history via Python
+### Price Data: current via GOOGLEFINANCE, history via Python
 - **Current** price: GOOGLEFINANCE formulas in the sheet (Holdings, Stock Metrics) — always fresh, no Python live-quote calls.
-- **5-year weekly closing history:** fetched by Python/yfinance into the `Price History` tab. A date-ranged series is a 2-D spill that can't fit a one-row-per-symbol tab, and the closes are wanted as values.
-- The 52-week high/low GOOGLEFINANCE columns were **removed** in favor of the full history.
+- **History:** Python/yfinance fetches the **5-yr weekly series into the Drive cache** (`price_history_cache.json`), which feeds the Performance year-boundary valuations. The `Price History` **tab** shows only **anniversary snapshots** (Today, 1Y–5Y Ago), one **row per symbol** — the slim human view; each value is the latest weekly close on/before that anniversary.
+- The 52-week high/low GOOGLEFINANCE columns were **removed** in favor of this history.
 - Python also writes fundamentals (ROE, P/E, dividend yield, net income, book value); ROE history = 4 years.
 
 ### Performance: money-weighted returns (XIRR lifetime + Modified Dietz per-year)
@@ -435,6 +433,10 @@ sweep cash model (Decision 19)** and a Bank-Interest-only cash yield — see the
   whole-account return — external contributions can't be separated from sweeps (Decision 19).
 - **Reuses** the same filtered transaction set as Holdings (`filter_and_partition`) so nothing is
   double-counted; `positions_as_of` replays FIFO to a date for year-boundary share counts.
+- **Presentation is sheet-driven:** the numbers above are written to the `Performance` + `Performance By
+  Year` data tabs each run; the interactive **`Performance Compare`** tab (fixed dropdown slots → live
+  `VLOOKUP`/`INDEX-MATCH` formulas) renders side-by-side per-symbol cards on top of them. Scaffolded once
+  and never overwritten — the math stays in Python, the comparison stays in the sheet.
 - **Caveats:** per-year coverage is bounded by the 5-yr price-history window; pre-cutoff dividends are
   absent, so total return understates income for long-held bootstrapped lots.
 
@@ -507,6 +509,8 @@ sweep cash model (Decision 19)** and a Bank-Interest-only cash yield — see the
 21. **CSV type detection is filename-first, then header-sniffing**: `detect_csv_type()` matches known Merrill prefixes (`PendingAndSettledActivity`/`Settled`→activity, `Holdings`, `Realized`, `Unrealized`); if the name doesn't match AND a filepath is given, it sniffs the header row (utf-8-sig). Fallback order is load-bearing: `Trade Date`→activity, `Unit Cost ($)`→unrealized, `Liquidation Date`→realized, `Price ($)`→holdings — `Price ($)` is checked LAST because activity rows also have it. Filename always wins over content. Without the fallback, user-renamed files (e.g. `activity_1.csv`) classify as `unknown` and are silently skipped → 0 rows processed on first run. Always pass the local path: `detect_csv_type(name, path)`.
 
 22. **Sheet header labels are decoupled from dedup keys**: Output headers are Title Case for humans, but the Transactions dedup reads rows back by **column position** against `TRANSACTIONS_KEYS` (writer.py), NOT by header text — which is why relabeling headers (snake_case → Title Case) is safe on an already-deployed sheet. Two invariants follow: (a) **never reorder Transactions columns** or change `TRANSACTIONS_KEYS` — existing rows would mis-map and re-import as duplicates; (b) `As Of Date` is last on Holdings/Cash/Stock Metrics, which are clear-and-rewrite (safe to reorder). Append-only tabs (Transactions, Run Log) get row 1 re-written each run via `_refresh_header` so the visible header stays current. The regression guard is `test_dedup_readback_is_position_based`.
+
+23. **`Performance Compare` is set-up-once — never make it clear-and-rewrite**: unlike every other Python-written tab, `write_performance_compare` **no-ops when the tab already exists** so the user's dropdown picks survive across runs. The cards stay current anyway because they are *formulas* into the `Performance`/`Performance By Year` data tabs (and the year rows are `YEAR(TODAY())`-relative). Clearing/rewriting it each run would silently wipe the selections — and the Sheets API can't recreate a true multi-select "chip" dropdown (UI-only), only the single-select `ONE_OF_RANGE` slots Python applies via `sh.batch_update`. Guards: `test_write_performance_compare_idempotent_when_present`, `test_write_performance_compare_sets_dropdown_validation`.
 
 ---
 
