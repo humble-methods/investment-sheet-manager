@@ -11,6 +11,13 @@ SYMBOL_OVERRIDES: dict[str, str] = {
 CASH_CUSIPS: set[str] = {"990156937"}
 CASH_SYMBOLS: set[str] = {"IIAXX"}
 
+# Symbols known to be unavailable on yfinance — e.g. brand-new spinoff ADRs Yahoo
+# hasn't indexed yet (SFGYY = Sony Financial Group, spun off Sep 2025). The runner
+# still attempts the fetch; this set only controls how a blank result is REPORTED:
+# listed symbols are logged as "expected" blanks rather than flagged as problems.
+# To REMAP a Merrill ticker to a working yfinance ticker instead, use SYMBOL_OVERRIDES.
+EXPECTED_MISSING_SYMBOLS: set[str] = {"SFGYY"}
+
 # Cash / money-market identifiers (per-account cash accounts, ~$1 NAV)
 CASH_SWEEP_CUSIP: str = "990156937"  # ML DIRECT DEPOSIT PROGRM (CMA cash)
 CASH_MMKT_SYMBOL: str = "IIAXX"      # BofA RASP (Roth cash)

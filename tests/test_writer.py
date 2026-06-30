@@ -643,7 +643,8 @@ def _make_fundamentals():
     return {
         "AAPL": StockFundamentals(
             symbol="AAPL", pe_ratio=28.4, dividend_yield=0.0055,
-            roe_current=1.47, roe_1y=1.60, roe_2y=1.55, roe_3y=1.45, roe_4y=1.30,
+            roe_current=1.47,
+            roe_by_year={"2025": 1.60, "2024": 1.55, "2023": 1.45, "2022": 1.30},
             net_income=94_000_000_000, book_value=64_000_000_000,
             fetched_at="2026-01-30T10:00:00",
         ),
@@ -666,12 +667,28 @@ def test_write_stock_metrics_googfinance_formulas():
     write_stock_metrics(sh, _make_fundamentals(), date(2026, 1, 30))
     rows = ws.append_rows.call_args[0][0]
     row = rows[0]
-    # AAPL is in row 2, symbol now in column A; current_price (col K) references it
-    assert 'GOOGLEFINANCE(A2,"price")' in row[10]   # current_price
-    assert row[11] == "2026-01-30"  # as_of_date moved to last column (L)
+    # AAPL is in row 2, symbol in column A; current_price (col Q, idx 16) references it
+    assert 'GOOGLEFINANCE(A2,"price")' in row[16]   # current_price
+    assert row[17] == "2026-01-30"  # as_of_date is the last column (R)
     # 52-week high/low GOOGLEFINANCE columns are gone
     assert len(row) == len(STOCK_METRICS_HEADERS)
     assert not any("high52" in str(c) or "low52" in str(c) for c in row)
+
+
+def test_write_stock_metrics_roe_relative_year_columns():
+    sh, ws = _metrics_sh()
+    write_stock_metrics(sh, _make_fundamentals(), date(2026, 1, 30))
+    row = ws.append_rows.call_args[0][0][0]
+    # Columns E..N = ROE 1Y..10Y Ago; run year 2026 → 1Y Ago == fiscal 2025, etc.
+    assert row[4] == 1.60   # 1Y Ago  (2025)
+    assert row[5] == 1.55   # 2Y Ago  (2024)
+    assert row[6] == 1.45   # 3Y Ago  (2023)
+    assert row[7] == 1.30   # 4Y Ago  (2022)
+    # 5Y..10Y Ago (2021..2016) have no data yet → blank, ready to fill over time
+    for i in range(8, 14):
+        assert row[i] == "", f"index {i} (>=5Y Ago) should be blank"
+    # 10 ROE-year columns are provisioned
+    assert sum(1 for h in STOCK_METRICS_HEADERS if h.startswith("ROE (") and "Ago" in h) == 10
 
 
 def test_write_stock_metrics_no_52wk_columns():
@@ -687,7 +704,7 @@ def test_write_stock_metrics_none_fields_written_as_empty():
     fundamentals = {
         "IX": StockFundamentals(
             symbol="IX", pe_ratio=None, dividend_yield=None,
-            roe_current=None, roe_1y=None, roe_2y=None, roe_3y=None, roe_4y=None,
+            roe_current=None, roe_by_year={},
             net_income=None, book_value=None, fetched_at="2026-01-30T10:00:00",
         )
     }
@@ -695,8 +712,8 @@ def test_write_stock_metrics_none_fields_written_as_empty():
     rows = ws.append_rows.call_args[0][0]
     row = rows[0]
     assert row[0] == "IX"  # symbol now column A
-    # pe_ratio through book_value (indices 1-9) should all be ""
-    for i in range(1, 10):
+    # pe_ratio through book_value (indices 1-15) should all be ""
+    for i in range(1, 16):
         assert row[i] == "", f"index {i} should be empty"
 
 

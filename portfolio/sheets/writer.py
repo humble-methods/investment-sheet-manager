@@ -57,13 +57,18 @@ CASH_HEADERS = [
     "Account Number", "Account Registration", "Owner", "Cash Account",
     "Reconstructed", "Snapshot", "Drift", "As Of Date",
 ]
-# A=Symbol B=P/E Ratio C=Dividend Yield D=ROE (Current) E=ROE (1Y Ago)
-# F=ROE (2Y Ago) G=ROE (3Y Ago) H=ROE (4Y Ago) I=Net Income J=Book Value
-# K=Current Price L=As Of Date
+# A=Symbol B=P/E Ratio C=Dividend Yield D=ROE (Current) E..N=ROE (1Y..10Y Ago)
+# O=Net Income P=Book Value Q=Current Price R=As Of Date
+# The sheet is provisioned for 10 ROE years; yfinance yields ~4 per fetch, so the
+# later columns fill in over time as the cache accumulates (see yfinance_client).
+# Columns are RELATIVE ("N Y Ago"): at write time each ticker's calendar-year ROE
+# (cache key) is placed under column k where year == run_year - k.
 # 5-year weekly closes live on the separate Price History tab (fetched by Python).
+ROE_YEARS_BACK = 10
+_ROE_YEAR_HEADERS = [f"ROE ({k}Y Ago)" for k in range(1, ROE_YEARS_BACK + 1)]
 STOCK_METRICS_HEADERS = [
     "Symbol", "P/E Ratio", "Dividend Yield", "ROE (Current)",
-    "ROE (1Y Ago)", "ROE (2Y Ago)", "ROE (3Y Ago)", "ROE (4Y Ago)",
+    *_ROE_YEAR_HEADERS,
     "Net Income", "Book Value", "Current Price", "As Of Date",
 ]
 RUN_LOG_HEADERS = [
@@ -411,19 +416,22 @@ def write_stock_metrics(
     for i, (symbol, f) in enumerate(sorted(fundamentals.items())):
         row_num = i + 2
         sym_ref = f"A{row_num}"
+        # Project the calendar-year-keyed ROE cache onto relative columns:
+        # "N Y Ago" == fiscal year (run_year - N). Blank where no data yet.
+        roe_cols = []
+        for k in range(1, ROE_YEARS_BACK + 1):
+            value = f.roe_by_year.get(str(run_date.year - k))
+            roe_cols.append("" if value is None else value)
         rows.append([
             symbol,                                                # A
             "" if f.pe_ratio is None else f.pe_ratio,             # B
             "" if f.dividend_yield is None else f.dividend_yield,  # C
             "" if f.roe_current is None else f.roe_current,        # D
-            "" if f.roe_1y is None else f.roe_1y,                  # E
-            "" if f.roe_2y is None else f.roe_2y,                  # F
-            "" if f.roe_3y is None else f.roe_3y,                  # G
-            "" if f.roe_4y is None else f.roe_4y,                  # H
-            "" if f.net_income is None else f.net_income,          # I
-            "" if f.book_value is None else f.book_value,          # J
-            f'=IFERROR(GOOGLEFINANCE({sym_ref},"price"),"N/A")',   # K current_price
-            run_date.isoformat(),                                  # L as_of_date
+            *roe_cols,                                             # E..N (1Y..10Y Ago)
+            "" if f.net_income is None else f.net_income,          # O
+            "" if f.book_value is None else f.book_value,          # P
+            f'=IFERROR(GOOGLEFINANCE({sym_ref},"price"),"N/A")',   # Q current_price
+            run_date.isoformat(),                                  # R as_of_date
         ])
 
     if rows:

@@ -249,6 +249,14 @@ All symbol normalization lives in `portfolio/market/symbol_overrides.py`.
 ### ADR Symbols
 Merrill uses standard US ticker symbols for ADRs (`IX`, `TM`, `LYG`, `TSM`, etc.). These work directly with yfinance.
 
+### Symbols Unavailable on yfinance
+Some symbols return nothing from yfinance — notably brand-new spinoff ADRs Yahoo hasn't indexed yet
+(e.g. `SFGYY` = Sony Financial Group, spun off Sep 2025). The runner still attempts the fetch and
+degrades gracefully (blank row), and **surfaces** blank symbols into the Run Log notes
+(`No yfinance fundamentals: …` / `No price history: …`). `config.EXPECTED_MISSING_SYMBOLS` only
+controls *reporting* (expected vs. flagged) — it does NOT skip the fetch. To actually **remap** a
+Merrill ticker to a working yfinance ticker, use `SYMBOL_OVERRIDES`.
+
 ---
 
 ## Google Drive Folder Structure
@@ -320,8 +328,11 @@ the bootstrap; `snapshot` is from the latest Holdings CSV (blank if none this ru
 
 ### Stock Metrics tab
 Covers **every recorded symbol (held or sold) + Watchlist**. Python writes (from yfinance, each run):
-`Symbol | P/E Ratio | Dividend Yield | ROE (Current) | ROE (1Y Ago) | ROE (2Y Ago) | ROE (3Y Ago) | ROE (4Y Ago) | Net Income | Book Value | Current Price | As Of Date`
+`Symbol | P/E Ratio | Dividend Yield | ROE (Current) | ROE (1Y Ago) | … | ROE (10Y Ago) | Net Income | Book Value | Current Price | As Of Date`
 
+- Ten ROE-year columns (`ROE (1Y Ago)`…`ROE (10Y Ago)`, cols E–N). yfinance yields ~4 years per
+  fetch, so the later columns are blank now and self-fill over time (see Non-Obvious Behaviors).
+  Current Price is now col Q, As Of Date col R.
 - Current Price is a GOOGLEFINANCE formula (symbol in col A): `=IFERROR(GOOGLEFINANCE(A2, "price"), "N/A")`
 - The 52-week high/low columns were **removed**; price history now lives on the Price History tab
   (anniversary snapshots on the tab; full weekly series in the Drive cache).
@@ -511,6 +522,8 @@ Dropdowns + a frozen header/label are applied via the raw Sheets API (`sh.batch_
 22. **Sheet header labels are decoupled from dedup keys**: Output headers are Title Case for humans, but the Transactions dedup reads rows back by **column position** against `TRANSACTIONS_KEYS` (writer.py), NOT by header text — which is why relabeling headers (snake_case → Title Case) is safe on an already-deployed sheet. Two invariants follow: (a) **never reorder Transactions columns** or change `TRANSACTIONS_KEYS` — existing rows would mis-map and re-import as duplicates; (b) `As Of Date` is last on Holdings/Cash/Stock Metrics, which are clear-and-rewrite (safe to reorder). Append-only tabs (Transactions, Run Log) get row 1 re-written each run via `_refresh_header` so the visible header stays current. The regression guard is `test_dedup_readback_is_position_based`.
 
 23. **`Performance Compare` is set-up-once — never make it clear-and-rewrite**: unlike every other Python-written tab, `write_performance_compare` **no-ops when the tab already exists** so the user's dropdown picks survive across runs. The cards stay current anyway because they are *formulas* into the `Performance`/`Performance By Year` data tabs (and the year rows are `YEAR(TODAY())`-relative). Clearing/rewriting it each run would silently wipe the selections — and the Sheets API can't recreate a true multi-select "chip" dropdown (UI-only), only the single-select `ONE_OF_RANGE` slots Python applies via `sh.batch_update`. Guards: `test_write_performance_compare_idempotent_when_present`, `test_write_performance_compare_sets_dropdown_validation`.
+
+24. **ROE history accumulates by calendar year across runs**: yfinance returns only ~4 annual columns per fetch, but Stock Metrics is provisioned for 10 years. The cache (`yfinance_cache.json`) stores `roe_by_year` keyed by the fiscal period-end's **calendar year** (string keys), and `fetch_fundamentals` **merges** each run's freshly-fetched years into the prior cached dict (fresh wins on collision) — older years persist even after they drop out of yfinance's window, so the cache grows toward 10 years over time. Two consequences: (a) **never replace the cached `roe_by_year` wholesale** on a fresh fetch — that destroys accumulated history; (b) sheet columns are **relative** (`ROE (NY Ago)`), mapped at write time by `year == run_year − N`, so blanks beyond ~4Y now self-fill on future runs. ROE pairs income/equity **by year**, not by column position. Guards: `test_roe_history_keyed_by_calendar_year`, `test_roe_history_accumulates_old_years_across_runs`, `test_write_stock_metrics_roe_relative_year_columns`.
 
 ---
 

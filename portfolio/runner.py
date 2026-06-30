@@ -31,8 +31,13 @@ from portfolio.engine.holdings import (
     positions_as_of,
     verify_against_snapshot,
 )
+from portfolio.config import EXPECTED_MISSING_SYMBOLS
 from portfolio.market.symbol_overrides import normalize_all
-from portfolio.market.yfinance_client import fetch_fundamentals, fetch_price_history
+from portfolio.market.yfinance_client import (
+    fetch_fundamentals,
+    fetch_price_history,
+    is_empty_fundamentals,
+)
 from portfolio.metrics.performance import build_performance
 from portfolio.models import RunLogEntry, Transaction
 from portfolio.parsers.activity_parser import parse_activity_csv
@@ -259,11 +264,25 @@ def run_update(credentials=None) -> None:
     save_yfinance_cache(service, cache_id, yf_cache)
     print(f"Fetched fundamentals for {len(fundamentals)} symbol(s)")
 
+    # Surface symbols yfinance returned nothing for, so they don't silently become
+    # blank Stock Metrics rows. Split expected (config) from unexpected for the log.
+    blank_fund = sorted(s for s, f in fundamentals.items() if is_empty_fundamentals(f))
+    unexpected_blank = [s for s in blank_fund if s not in EXPECTED_MISSING_SYMBOLS]
+    expected_blank = [s for s in blank_fund if s in EXPECTED_MISSING_SYMBOLS]
+    if unexpected_blank:
+        notes.append(f"No yfinance fundamentals: {', '.join(unexpected_blank)}")
+    if expected_blank:
+        notes.append(f"No yfinance fundamentals (expected): {', '.join(expected_blank)}")
+
     # --- 17b. Load cache, fetch 5-yr weekly closing prices, save cache ---
     ph_cache = load_price_history_cache(service, cache_id)
     histories = fetch_price_history(symbols, ph_cache)
     save_price_history_cache(service, cache_id, ph_cache)
     print(f"Fetched price history for {len(histories)} symbol(s)")
+
+    blank_hist = sorted(s for s, h in histories.items() if not h.closes)
+    if blank_hist:
+        notes.append(f"No price history: {', '.join(blank_hist)}")
 
     # --- 18. Write Stock Metrics + Price History ---
     write_stock_metrics(sh, fundamentals, date.today())
