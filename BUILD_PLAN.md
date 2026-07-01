@@ -54,9 +54,11 @@ Originally **all** corporate actions were out of scope (manual intervention; fla
 combos as `UNKNOWN`). Two amendments:
 - **Ticker renames are now handled in code** via `config.TICKER_RENAMES` (Phase 18) — a rename
   otherwise oversells (bootstrap lots under the old ticker, SELL under the new). First case `ATGE → CVSA`.
-- **Splits / stock dividends + inbound transfers** remain unhandled today: the parser still tags
-  them `UNKNOWN` and `build_lots` ignores them, so share counts understate post-split and the Cash
-  tab misses transfers. Handling these is **planned in Phase 19** (not yet built). Mergers stay manual.
+- **Splits / stock dividends** (share-changing, $0 amount) remain unhandled — the parser tags them
+  `UNKNOWN` and `build_lots` ignores them, so share counts understate post-split. **Planned in Phase 19**
+  (in-place lot scaling; VGT ×8 confirmed against the 06/26/2026 tax-lots file).
+- **Inbound cash transfers / contributions** are likewise dropped, so the Cash tab misses wires.
+  **Planned in Phase 20.** Mergers stay manual.
 
 ### Price strategy: current via GOOGLEFINANCE, history via Python (Phase 11, partial reversal)
 The original rule ("all price data via GOOGLEFINANCE; Python never fetches prices") is **partially reversed**: **5-year weekly historical closes are fetched by Python/yfinance** and written to a dedicated `Price History` tab, while the **current price stays a live GOOGLEFINANCE formula** on Holdings and Stock Metrics. Rationale: a date-ranged series is a 2-D spill that can't live one-row-per-symbol, and the user wants the raw closes available as values. The 52-week high/low GOOGLEFINANCE columns are removed in favor of the full history. (Amends the Phase 4/5 notes below.)
@@ -1107,30 +1109,90 @@ python3 -m pytest tests/test_symbol_overrides.py tests/test_fifo.py -q
 
 ---
 
-## Phase 19 — Stock Dividends / Splits + Inbound Transfers (PLANNED)
-**Goal:** Stop silently dropping share- and cash-moving activity types the parser currently tags `UNKNOWN`
-(see Non-Obvious Behaviors #26). Without this, holdings understate post-split quantities (a latent oversell
-next period) and the Cash tab misses transfers. **Status: not yet built.**
+## Phase 19 — Stock Splits / Stock Dividends (in-place lot scaling) (PLANNED)
+**Goal:** Handle the `$0.00`-amount share-change events the parser currently drops as `UNKNOWN`
+(Non-Obvious #26) by **adjusting the original lots in place** — never adding `$0`-cost shares at the
+event date. **Status: not yet built.**
 
-### Scope (observed in the 04–06/2026 activity file)
-- **`SecurityTransactions / Stock Dividend Due Bill`** and **`SecurityTransactions / Dividend`** with a *share* quantity and `$0.00` amount — these are stock dividends / splits delivered as shares. Observed netting per (account, symbol): a `+N` due bill, a `−N` due bill reversal, then a `+N` Dividend → **net `+N` shares**. Examples: KLAC `73S-17D17` +306 on 34 sh (≈10-for-1); VGT `53X-69S37` +70 on 10 sh (≈8-for-1).
-- **`FundTransfers / Funds Received`** — inbound cash (e.g. two $30,000 wires); affects the cash ledger, not equity.
-- **`FundReceipts / Current Year Contribution`** — Roth contribution (e.g. $8,000); cash-in.
+### Decision (locked with user)
+A split / stock dividend **scales the existing lots**: `quantity × ratio`, `unit_cost ÷ ratio`, with
+**acquisition date and total cost basis unchanged**. Adding new `$0`-cost lots at the event date would
+inject a phantom present-day acquisition that **wrecks the XIRR / annualized-return** metric — explicitly
+rejected.
 
-### Deliverables (proposed)
-- `portfolio/parsers/activity_parser.py` — extend `TX_TYPE_MAP` with the new combos → new canonical types (e.g. `STOCK_DIVIDEND` / `SPLIT`, `CASH_IN`).
-- `portfolio/engine/fifo.py` — a share-adding event that creates a `$0` cost lot (split/stock-dividend: total cost basis unchanged, avg cost drops across more shares). Decide due-bill netting so `+N/−N/+N` resolves to one `+N`.
-- `portfolio/engine/cash.py` — fold `Funds Received` / contributions into `reconstruct_cash` (mind the sweep double-count hazard, Decision/Phase 3).
-- `tests/test_activity_parser.py`, `tests/test_fifo.py`, `tests/test_cash.py`.
+### Scope (04–06/2026 file)
+- `SecurityTransactions / Stock Dividend Due Bill` (a `+N` due bill then a `−N` reversal) and
+  `SecurityTransactions / Dividend` with a **share** quantity + `$0.00` amount (the `+N` delivery). Per
+  `(account, symbol, event)` these **net to `+N`**. Examples: **VGT** `53X-69S37` 10→80 (**×8**);
+  **KLAC** `73S-17D17` 34→340 (**×10**).
 
-### Open questions (confirm before building)
-- **Due-bill semantics:** is the canonical interpretation always `+N` (due bill) → `−N` (reversal) → `+N` (dividend) = net `+N`, or can the dividend/due-bill arrive without the pair? Validate against another multi-period file.
-- **Cost-basis treatment:** treat as a split (spread existing basis over new shares, $0 added basis) — confirm vs. a taxable stock dividend (basis = FMV).
-- **Cash double-count:** confirm `Funds Received` is NOT also mirrored by a sweep `Deposit` row (which would double-count, per Phase 3's hazard).
+### Approach
+- **New canonical type `SPLIT`** in the parser: map both `Stock Dividend Due Bill` and the `$0`/share
+  `SecurityTransactions/Dividend` combos to `SPLIT`, carrying the **signed share quantity**. Disambiguate
+  from a normal cash dividend on `amount == 0 and quantity is not None` (a real dividend has a nonzero
+  amount and no quantity → stays `DIVIDEND`).
+- **FIFO replay (`build_lots`)**: per `(account, symbol)` the event's **net delta = Σ SPLIT quantities**
+  (so `+N / −N / +N → +N`; order- and cross-file-robust because replay sees every row). Ratio =
+  `(running_qty + net_delta) / running_qty`; scale every open lot of that key (`qty *= ratio`,
+  `unit_cost /= ratio`). Cross-check against the broker `HOLDING N` base parsed from Description 2 and
+  **flag** a mismatch (signals our running qty diverged — e.g. a missed earlier event). Sort `SPLIT`
+  after same-day BUY/INIT_BUY so the ratio sees the full pre-split position.
+
+### Deliverables
+- `portfolio/parsers/activity_parser.py` (TX_TYPE_MAP + `SPLIT` disambiguation; parse `HOLDING N` base)
+- `portfolio/engine/fifo.py` (`SPLIT` lot-scaling during replay)
+- `tests/test_activity_parser.py`, `tests/test_fifo.py`
 
 ### Validation
+- Unit: `+N / −N / +N` resolves to one ×ratio scaling; lots scale qty **up** / cost **down**;
+  **total cost basis and acquisition dates unchanged**; XIRR unaffected (no cashflow injected).
+- Real data — **VGT confirmed** against `UnrealizedGainLossTaxLots_06262026` (`53X-69S37`): original lot
+  10 sh @ $671.03 (basis $6,710.30, acq 7/7/2025) → **80 sh @ $83.88, basis $6,710.30, acq 7/7/2025**
+  (×8: qty up, unit cost down, basis + acquisition date unchanged). Use this file as the end-to-end
+  regression fixture. KLAC `73S-17D17` → 340 sh (×10) — **still deferred** (that account isn't in the file).
 ```bash
-python3 -m pytest tests/test_activity_parser.py tests/test_fifo.py tests/test_cash.py -q
+python3 -m pytest tests/test_activity_parser.py tests/test_fifo.py -q
+```
+
+### Open question (non-blocking)
+Ratio source of truth — broker `HOLDING N` base (authoritative) vs. engine running qty. Plan uses running
+qty with a `HOLDING`-base cross-check; revisit only if they ever disagree.
+
+---
+
+## Phase 20 — Cash-Affecting Transfers + Cash-Model Validation (PLANNED)
+**Goal:** Capture external cash inflows correctly and finally **validate `reconstruct_cash` against a
+post-period Holdings snapshot** (the long-standing Phase 3 / Decision 19 double-count hazard).
+**Status: not yet built.**
+
+### Decisions (locked with user — "track inflows, de-dup contributions")
+- **`FundTransfers / Funds Received` → `CASH_IN`.** It is the *only* record of the wire — the $30K wires
+  have **no** matching `990156937` sweep `Deposit` row (verified in the 04–06/2026 file) — so omitting it
+  under-reconstructs cash.
+- **`FundReceipts / Current Year Contribution` → ignore for cash.** The same money already appears as an
+  `IIAXX` `Other/Deposit` (e.g. the $8,000 contribution on 1/5 → IIAXX deposit on 1/6), so counting both
+  **double-counts**. Keep the row in Transactions for the record only.
+
+### Approach
+- Parser: `FundTransfers/Funds Received → CASH_IN`; `FundReceipts/Current Year Contribution →
+  CONTRIBUTION_INFO` (recorded, excluded from cash math).
+- `reconstruct_cash`: credit `Funds Received` to the account's cash account (CMA → `990156937` sweep;
+  Roth → `IIAXX`) since the row's `Symbol/CUSIP #` is `--`; confirm it is not *also* netted into a sweep row.
+- **Amends Decision 19:** external contributions are now *partially* separable (explicit transfer rows),
+  so the cash balance can include them; return-vs-contribution attribution stays out of scope.
+
+### Deliverables
+- `portfolio/parsers/activity_parser.py` (TX_TYPE_MAP additions)
+- `portfolio/engine/cash.py` (`reconstruct_cash` includes `Funds Received`; account → cash-account resolution)
+- `tests/test_activity_parser.py`, `tests/test_cash.py`
+
+### Validation
+- Unit: a `Funds Received` row raises reconstructed cash by its amount on the right cash account; a
+  `Current Year Contribution` paired with its `IIAXX` deposit nets to **one** inflow (no double-count).
+- Real data (**deferred — needs a post-Jun Holdings CSV**): reconstruct CMA/Roth cash through 06/2026 and
+  reconcile to the snapshot sweep/IIAXX balances; drift ≈ 0.
+```bash
+python3 -m pytest tests/test_activity_parser.py tests/test_cash.py -q
 ```
 
 ---
@@ -1159,9 +1221,10 @@ Phase 9 (Human headers, dedup-safe reads)
                     └── Phase 15 (Price History reshape)  ← anniversary snapshots, rows = symbols
 
 Cross-cutting (corporate actions + metrics depth; sequence by dependency):
-Phase 17 (ROE by calendar year, 10-yr capacity)  ← supersedes Phase 4 ROE fields [built]
-Phase 18 (Ticker renames, TICKER_RENAMES)         ← fixes rename oversell in Phase 3 FIFO [built]
-Phase 19 (Stock dividends/splits + transfers)     ← extends Phase 2 parser + Phase 3 FIFO/cash [planned]
+Phase 17 (ROE by calendar year, 10-yr capacity)   ← supersedes Phase 4 ROE fields [built]
+Phase 18 (Ticker renames, TICKER_RENAMES)          ← fixes rename oversell in Phase 3 FIFO [built]
+Phase 19 (Stock splits/dividends, in-place lots)   ← extends Phase 2 parser + Phase 3 FIFO [planned]
+Phase 20 (Cash transfers + cash-model validation)  ← extends Phase 2 parser + Phase 3 cash [planned]
 Phase 8 (Hardening) is orthogonal — do it before or after 9–11.
 ```
 
