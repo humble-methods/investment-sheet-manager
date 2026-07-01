@@ -106,10 +106,13 @@ def test_security_dividend_with_amount_is_not_split(tmp_path):
     assert tx.tx_type != "SPLIT"
 
 
-def test_funds_received_is_cash_in():
-    # Phase 20: an external wire → CASH_IN with no symbol (credits cash).
+def test_funds_received_is_cash_transfer_in():
+    # Phase 20: an external wire → CASH_TRANSFER_IN, symbol None. Its own type
+    # (not CASH_IN) because the Amount is POSITIVE for an inflow — the opposite
+    # of a sweep Deposit's parens — so cash math must add it, not subtract it.
     txns = parse_activity_csv(SAMPLE)
-    wire = next(t for t in txns if t.tx_type == "CASH_IN" and t.amount == -30000.0)
+    wire = next(t for t in txns if t.tx_type == "CASH_TRANSFER_IN")
+    assert wire.amount == 30000.0  # real exports ship this POSITIVE, no parens
     assert wire.symbol is None
     assert wire.account_number == "11A-00003"
 
@@ -119,7 +122,7 @@ def test_current_year_contribution_is_recorded_not_cash():
     # can exclude it (the money already shows as an IIAXX deposit).
     txns = parse_activity_csv(SAMPLE)
     contrib = next(t for t in txns if t.tx_type == "CONTRIBUTION_INFO")
-    assert contrib.amount == -8000.0
+    assert contrib.amount == 8000.0  # positive in real exports
     assert contrib.symbol is None
     assert contrib.account_number == "22B-00001"
 

@@ -27,11 +27,13 @@ TX_TYPE_MAP: dict[tuple[str, str], str] = {
     ("Other", "Depository Bank (ADR) Fee"): "ADR_FEE",
     ("Other", "Foreign Tax Withholding"): "TAX_WITHHOLDING",
     # Phase 20: external cash movements. A "Funds Received" wire is the ONLY
-    # record of that cash (no matching sweep Deposit row), so it credits cash. A
-    # "Current Year Contribution" is recorded for the paper trail only — the same
-    # money already lands as an IIAXX Deposit, so counting it too double-counts;
-    # reconstruct_cash excludes CONTRIBUTION_INFO from the balance.
-    ("FundTransfers", "Funds Received"): "CASH_IN",
+    # record of that cash (no matching sweep Deposit row), so it credits cash. It
+    # gets its OWN type (not CASH_IN) because its Amount is positive-for-inflow —
+    # the opposite of a sweep Deposit's parens convention — and reconstruct_cash
+    # must add it, not subtract it. A "Current Year Contribution" is recorded for
+    # the paper trail only — the same money already lands as an IIAXX Deposit, so
+    # counting it too double-counts; reconstruct_cash excludes CONTRIBUTION_INFO.
+    ("FundTransfers", "Funds Received"): "CASH_TRANSFER_IN",
     ("FundReceipts", "Current Year Contribution"): "CONTRIBUTION_INFO",
 }
 
