@@ -71,6 +71,27 @@ def test_pre_cutoff_and_unbootstrapped_rows_excluded():
     assert "99Z-99999" not in balances
 
 
+def test_funds_received_wire_credits_cash():
+    # Phase 20: a "Funds Received" wire (CASH_IN, symbol None) is the only record
+    # of that external cash — no sweep Deposit mirrors it — so it credits cash.
+    txns = [cash_tx("CASH_IN", -30000.0)]
+    balances = reconstruct_cash(txns, {"11A-00003": 0.0}, STATE)
+    assert balances["11A-00003"] == 30000.0
+
+
+def test_contribution_info_excluded_no_double_count():
+    # Phase 20: a Current Year Contribution is recorded-only; the same $8,000
+    # already arrives as an IIAXX Deposit, so only the deposit moves cash.
+    txns = [
+        cash_tx("CONTRIBUTION_INFO", -8000.0, account="22B-00001",
+                registration="Roth IRA-Edge"),
+        cash_tx("CASH_IN", -8000.0, account="22B-00001",
+                registration="Roth IRA-Edge"),  # the IIAXX deposit
+    ]
+    balances = reconstruct_cash(txns, {"22B-00001": 0.0}, STATE)
+    assert balances["22B-00001"] == 8000.0  # counted once, not 16000
+
+
 def test_reconcile_drift_none_without_snapshot():
     balances = reconcile_cash({"11A-00003": 100.0}, None, date(2026, 2, 1), REGS)
     assert len(balances) == 1

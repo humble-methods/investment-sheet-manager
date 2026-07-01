@@ -54,11 +54,12 @@ Originally **all** corporate actions were out of scope (manual intervention; fla
 combos as `UNKNOWN`). Two amendments:
 - **Ticker renames are now handled in code** via `config.TICKER_RENAMES` (Phase 18) — a rename
   otherwise oversells (bootstrap lots under the old ticker, SELL under the new). First case `ATGE → CVSA`.
-- **Splits / stock dividends** (share-changing, $0 amount) remain unhandled — the parser tags them
-  `UNKNOWN` and `build_lots` ignores them, so share counts understate post-split. **Planned in Phase 19**
-  (in-place lot scaling; VGT ×8 confirmed against the 06/26/2026 tax-lots file).
-- **Inbound cash transfers / contributions** are likewise dropped, so the Cash tab misses wires.
-  **Planned in Phase 20.** Mergers stay manual.
+- **Splits / stock dividends** (share-changing, $0 amount) are handled in code (Phase 18) via a new
+  `SPLIT` type + in-place lot scaling (`qty ×ratio`, `unit_cost ÷ratio`, basis + acq date unchanged),
+  applied during FIFO replay. VGT ×8 confirmed against the 06/26/2026 tax-lots file. **Built in Phase 19.**
+- **Inbound cash transfers** (`Funds Received` wires → `CASH_IN`) now credit reconstructed cash;
+  **Roth contributions** (`Current Year Contribution` → `CONTRIBUTION_INFO`) are recorded-only and
+  excluded from cash math (the IIAXX deposit already books them). **Built in Phase 20.** Mergers stay manual.
 
 ### Price strategy: current via GOOGLEFINANCE, history via Python (Phase 11, partial reversal)
 The original rule ("all price data via GOOGLEFINANCE; Python never fetches prices") is **partially reversed**: **5-year weekly historical closes are fetched by Python/yfinance** and written to a dedicated `Price History` tab, while the **current price stays a live GOOGLEFINANCE formula** on Holdings and Stock Metrics. Rationale: a date-ranged series is a 2-D spill that can't live one-row-per-symbol, and the user wants the raw closes available as values. The 52-week high/low GOOGLEFINANCE columns are removed in favor of the full history. (Amends the Phase 4/5 notes below.)
@@ -1109,10 +1110,11 @@ python3 -m pytest tests/test_symbol_overrides.py tests/test_fifo.py -q
 
 ---
 
-## Phase 19 — Stock Splits / Stock Dividends (in-place lot scaling) (PLANNED)
-**Goal:** Handle the `$0.00`-amount share-change events the parser currently drops as `UNKNOWN`
+## Phase 19 — Stock Splits / Stock Dividends (in-place lot scaling) (BUILT)
+**Goal:** Handle the `$0.00`-amount share-change events the parser previously dropped as `UNKNOWN`
 (Non-Obvious #26) by **adjusting the original lots in place** — never adding `$0`-cost shares at the
-event date. **Status: not yet built.**
+event date. **Status: built.** New `SPLIT` type + FIFO in-place scaling; `parse_holding_base` cross-check
+logs a warning on divergence. Real-data VGT ×8 confirmed via unit fixture; KLAC ×10 still deferred.
 
 ### Decision (locked with user)
 A split / stock dividend **scales the existing lots**: `quantity × ratio`, `unit_cost ÷ ratio`, with
@@ -1160,10 +1162,12 @@ qty with a `HOLDING`-base cross-check; revisit only if they ever disagree.
 
 ---
 
-## Phase 20 — Cash-Affecting Transfers + Cash-Model Validation (PLANNED)
+## Phase 20 — Cash-Affecting Transfers + Cash-Model Validation (PARTIALLY BUILT)
 **Goal:** Capture external cash inflows correctly and finally **validate `reconstruct_cash` against a
 post-period Holdings snapshot** (the long-standing Phase 3 / Decision 19 double-count hazard).
-**Status: not yet built.**
+**Status: parser + cash logic built** (`Funds Received → CASH_IN`, `Current Year Contribution →
+CONTRIBUTION_INFO` excluded from cash math). The real-data snapshot reconciliation remains **deferred**
+until a post-Jun Holdings CSV is available.
 
 ### Decisions (locked with user — "track inflows, de-dup contributions")
 - **`FundTransfers / Funds Received` → `CASH_IN`.** It is the *only* record of the wire — the $30K wires
@@ -1223,8 +1227,8 @@ Phase 9 (Human headers, dedup-safe reads)
 Cross-cutting (corporate actions + metrics depth; sequence by dependency):
 Phase 17 (ROE by calendar year, 10-yr capacity)   ← supersedes Phase 4 ROE fields [built]
 Phase 18 (Ticker renames, TICKER_RENAMES)          ← fixes rename oversell in Phase 3 FIFO [built]
-Phase 19 (Stock splits/dividends, in-place lots)   ← extends Phase 2 parser + Phase 3 FIFO [planned]
-Phase 20 (Cash transfers + cash-model validation)  ← extends Phase 2 parser + Phase 3 cash [planned]
+Phase 19 (Stock splits/dividends, in-place lots)   ← extends Phase 2 parser + Phase 3 FIFO [built]
+Phase 20 (Cash transfers + cash-model validation)  ← extends Phase 2 parser + Phase 3 cash [built; snapshot reconcile deferred]
 Phase 8 (Hardening) is orthogonal — do it before or after 9–11.
 ```
 

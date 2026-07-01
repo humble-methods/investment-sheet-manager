@@ -1,5 +1,6 @@
 """Shared parsing helpers: numbers, dates, symbols, descriptions."""
 
+import re
 from datetime import date, datetime
 from pathlib import Path
 
@@ -7,6 +8,11 @@ from portfolio.market.symbol_overrides import is_cash, normalize_symbol
 
 # Merrill Description 2 boilerplate: cut from whichever marker appears first.
 DESCRIPTION_MARKERS = ("ACTUAL PRICES, REMUNERATION", "CLIENT ENTERED.")
+
+# Split/stock-dividend rows embed the pre-event share count as "HOLDING N.NNNN"
+# in Description 2 (e.g. "...HOLDING 10.0000 PAY DATE..."). Used to cross-check
+# the engine's running quantity against the broker at split time (Phase 19).
+_HOLDING_RE = re.compile(r"HOLDING\s+([\d,]+(?:\.\d+)?)")
 
 
 def parse_amount(value: str) -> float | None:
@@ -58,6 +64,18 @@ def clean_description(raw: str) -> str:
     if cut_positions:
         raw = raw[: min(cut_positions)]
     return raw.strip()
+
+
+def parse_holding_base(description: str) -> float | None:
+    """
+    Extract the broker's pre-event share count from a "HOLDING N" fragment in a
+    Description 2 string, or None if absent. Used to cross-check the engine's
+    running quantity when applying a split / stock dividend (Phase 19).
+    """
+    match = _HOLDING_RE.search(description or "")
+    if match is None:
+        return None
+    return float(match.group(1).replace(",", ""))
 
 
 def strip_field(value: str) -> str:

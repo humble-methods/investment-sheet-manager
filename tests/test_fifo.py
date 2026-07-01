@@ -6,12 +6,13 @@ from portfolio.engine.fifo import build_lots, compute_positions
 from portfolio.models import Transaction
 
 
-def make_tx(tx_type, symbol, quantity, day, *, account="11A-00003", price=100.0):
+def make_tx(tx_type, symbol, quantity, day, *, account="11A-00003", price=100.0,
+            description=""):
     d = date(2024, 1, day)
     return Transaction(
         trade_date=d, settlement_date=d, status="Settled",
         account_number=account, account_registration="CMA-Edge",
-        tx_type=tx_type, description="", symbol=symbol,
+        tx_type=tx_type, description=description, symbol=symbol,
         quantity=quantity, price=price, amount=0.0, source_file="t.csv",
     )
 
@@ -120,6 +121,51 @@ def test_renamed_ticker_sell_depletes_bootstrap_lots():
     ]
     positions = compute_positions(build_lots(txns), {"11A-00003": "CMA-Edge"})
     assert positions == []  # 84 sold against 84 bootstrap shares; no oversell
+
+
+def test_split_scales_lots_in_place():
+    # VGT-style 8-for-1: 10 sh @ 671.03 (basis 6710.30, acq day 1) becomes
+    # 80 sh @ 83.878..., basis + acquisition date UNCHANGED. The split surfaces
+    # as a +N due bill, a -N reversal, and a +N delivery that net to +70.
+    txns = [
+        make_tx("INIT_BUY", "VGT", 10, 1, price=671.03),
+        make_tx("SPLIT", "VGT", 70, 5, description="HOLDING 10.0000 PAY DATE 01/05/2024"),
+        make_tx("SPLIT", "VGT", -70, 6),
+        make_tx("SPLIT", "VGT", 70, 6),
+    ]
+    dq = build_lots(txns)[("11A-00003", "VGT")]
+    assert len(dq) == 1
+    assert dq[0].quantity == pytest.approx(80.0)
+    assert dq[0].unit_cost == pytest.approx(671.03 / 8)
+    assert dq[0].cost_basis == pytest.approx(6710.30)  # basis unchanged
+    assert dq[0].acquisition_date == date(2024, 1, 1)   # acq date unchanged
+
+
+def test_split_after_same_day_buy_sees_full_position():
+    # A same-day BUY must be counted before the split scales (SPLIT sorts last).
+    txns = [
+        make_tx("INIT_BUY", "KLAC", 30, 1, price=500.0),
+        make_tx("BUY", "KLAC", 4, 5, price=800.0),
+        make_tx("SPLIT", "KLAC", 306, 5),  # 34 -> 340, x10
+    ]
+    assert qty(build_lots(txns), "11A-00003", "KLAC") == pytest.approx(340.0)
+
+
+def test_split_then_sell_no_oversell():
+    # Selling post-split shares must deplete the scaled lots, not oversell.
+    txns = [
+        make_tx("INIT_BUY", "VGT", 10, 1, price=671.03),
+        make_tx("SPLIT", "VGT", 70, 5),   # -> 80 sh
+        make_tx("SELL", "VGT", -80, 6),
+    ]
+    positions = compute_positions(build_lots(txns), {"11A-00003": "CMA-Edge"})
+    assert positions == []
+
+
+def test_split_injects_no_cashflow():
+    # A SPLIT is $0 and creates no new lot at the event date (would wreck XIRR).
+    txns = [make_tx("SPLIT", "VGT", 70, 5)]
+    assert build_lots(txns) == {}  # no lots created; nothing to scale
 
 
 def test_dividend_is_ignored():
