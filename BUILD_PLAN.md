@@ -1277,6 +1277,113 @@ no consumer relied on the pre-write ordering.
 
 ---
 
+## Phase 22 — In-Sheet Instructions + Tab Presentation (ordering, merge, hide) (PLANNED)
+**Goal:** Make the sheet self-explanatory and tidy for non-technical family users: a bilingual
+**Instructions** tab (driven by a **codebase source of truth** so it can't silently drift from the code),
+a **fixed, sensible tab order**, the **Stock Metrics + Price History** tabs merged into one, and the
+backing/debug tabs (**Performance By Year**, **Run Log**) **hidden**. **Status: not yet built.**
+
+### Decisions (locked with user)
+- **Canonical tab order, re-applied every run** (tabs currently land in creation order):
+  | # | Tab | Note |
+  |---|-----|------|
+  | 0 | **Instructions** | visible, leftmost |
+  | 1 | Transactions | |
+  | 2 | Holdings | |
+  | 3 | Performance | lifetime; readable, stays visible (also backs Compare) |
+  | 4 | **Stock Metrics** | Price History **merged in** (see below) |
+  | 5 | Performance Compare | |
+  | 6 | Watchlist | editable input |
+  | 7 | Cash | |
+  | — | Performance By Year | **hidden** — backing data for Performance Compare (+ pivot source) |
+  | — | Run Log | **hidden** — debug only |
+- **Merge Price History into Stock Metrics.** Both are one-row-per-symbol over the same symbol universe
+  (recorded ∪ watchlist), clear-and-rewrite. Merged columns:
+  `Symbol | P/E | Div Yield | ROE(1Y…10Y) | Net Income | Book Value | Current Price | Today | 1Y…5Y Ago |
+  As Of Date`. `Current Price` stays a `GOOGLEFINANCE` formula; anniversary prices stay static values
+  (Stock Metrics already mixes formula+value cells). The standalone **Price History tab is removed**; the
+  Drive `price_history_cache.json` (feeds the Performance year math) is **untouched** — this merges only
+  the display tabs.
+- **Performance By Year stays (Performance Compare `INDEX/MATCH`es it) but is HIDDEN.** Long-format backing
+  data; also the right **source for a hand-built per-year pivot** if the user wants one. Never delete while
+  Performance Compare exists.
+- **Run Log → HIDDEN, last, same spreadsheet.** Keep writing it every run (unchanged content); just move
+  it last + hide. (No separate spreadsheet / no external log file.)
+- **One Instructions tab, stacked, Traditional Chinese FIRST, then English**, placed **first / leftmost**.
+- **User supplies the Traditional Chinese.** The codebase source ships **English + `zh` placeholders**;
+  the user fills the `zh` strings. Tests must NOT fail on empty `zh` (warn/allow), only on missing tabs.
+- **Codebase file is the source of truth.** A single reference module holds each tab's purpose/how-to
+  (EN + ZH); `write_instructions` renders it, and a **drift guard** test ties it to the real tab set so a
+  tab added/removed/renamed in code fails CI until the guide is updated (the user's core ask).
+
+### Approach
+- **Merge Price History into Stock Metrics.** Fold `write_price_history`'s anniversary columns into
+  `write_stock_metrics` (one write, one row per symbol), drop the standalone `TAB_PRICE_HISTORY` tab and
+  its writer; keep `histories` fetching + the Drive cache exactly as-is. Update `STOCK_METRICS_HEADERS` and
+  the `As Of Date`-last invariant. (If the old Price History tab exists on a deployed sheet, delete it once
+  on migration.)
+- **New source module** `portfolio/sheets/tab_guide.py`: a `TabDoc` dataclass (`tab` = the real `TAB_*`
+  constant, `kind` = output|input|hidden, `en`, `zh`) and an ordered `TAB_GUIDE: list[TabDoc]` covering
+  every tab in canonical order, plus a short top-of-page "how the workflow works" blurb (drop CSVs → run →
+  read tabs; which two tabs are editable). Emphasize the **editable** surfaces (`Watchlist` = config list
+  of tickers to track even if unheld → flows into Stock Metrics; `Performance Compare` = pick symbols in
+  the row-1 dropdowns).
+- **`write_instructions(sh, guide)`** in `writer.py`: **clear-and-rewrite each run** (it has NO user
+  state and MUST track code — the deliberate OPPOSITE of the set-up-once `Watchlist`/`Performance Compare`
+  tabs, see #23/#30). Render ZH block, a divider, then EN block, as **values**.
+- **`apply_tab_order(sh)`**: one pass after all writes that sets each tab's `index` to the canonical order
+  and `hidden` = True for `Performance By Year` + `Run Log`, via a single `batch_update` of
+  `updateSheetProperties` requests (idempotent; tolerate already-hidden / missing optional tabs).
+- **Drift guard**: derive `WRITTEN_TABS` from a canonical order list (single source for both ordering and
+  the guard); test asserts `{d.tab for d in TAB_GUIDE} == WRITTEN_TABS`. Adding a `write_*` tab without a
+  `TabDoc` (or dropping one) fails the test.
+
+### Deliverables
+- `portfolio/sheets/tab_guide.py` (`TabDoc`, `TAB_GUIDE` — EN authored, ZH placeholders; canonical order)
+- `portfolio/sheets/writer.py` (`write_instructions`, `apply_tab_order`, merged `write_stock_metrics`,
+  remove `write_price_history`/`TAB_PRICE_HISTORY`, `WRITTEN_TABS`)
+- `portfolio/runner.py` (call `write_instructions`; drop the separate price-history write; `apply_tab_order`
+  as the final Sheets step)
+- `tests/test_writer.py` / `tests/test_tab_guide.py`
+- `CLAUDE.md` (tab-structure table: add `Instructions`, merge Price History into Stock Metrics, mark
+  `Performance By Year` + `Run Log` hidden; column-schema update; Non-Obvious for the clear-and-rewrite
+  exception + drift guard)
+
+### Validation
+- Unit: merged `write_stock_metrics` emits the fundamentals **and** anniversary-price columns in one row
+  per symbol, `As Of Date` last, `Current Price` still a `GOOGLEFINANCE` formula.
+- Unit: `write_instructions` renders **ZH before EN**, contains each tab's name + how-to, writes values
+  (not formulas); it is **clear-and-rewrite** (safe to re-run, no user state).
+- Unit: `apply_tab_order` sets the canonical `index` order and hides `Performance By Year` + `Run Log`
+  (idempotent when already ordered/hidden; skips optional tabs absent this run).
+- Unit (**drift guard**): `TAB_GUIDE` covers exactly `WRITTEN_TABS`; an undocumented new tab fails.
+- Unit: empty `zh` placeholders are **allowed** (guide still renders; guard passes).
+- Manual: run against the sheet; confirm order matches the table, Stock Metrics carries price columns,
+  Performance By Year + Run Log hidden but present.
+```bash
+python3 -m pytest tests/test_writer.py tests/test_tab_guide.py -q
+```
+
+### Risk
+`write_instructions` is the one Python tab that MUST clear-and-rewrite (opposite of #23/#30) — guard it so
+nobody "protects" it into a stale no-op. The drift guard only catches tab-set changes, not prose going
+stale within a tab (e.g. a column meaning changes) — content review stays a human step. Hiding
+`Performance By Year`/`Run Log` must never stop them being written (Compare backing data + debug lifeline).
+The Stock Metrics merge shifts column positions — re-check any position-based reader (though Stock Metrics
+is clear-and-rewrite, so lower risk than the Transactions tab).
+
+### Implementation notes (for the session that builds this)
+- **Format the Instructions tab — don't just dump values.** With ZH stacked first, a flat values grid reads
+  cramped. Apply light formatting so it reads like a document: **bold section headers** (a title per tab),
+  a **blank spacer row between tabs**, and a clear ZH/EN divider. Do it via `batch_update`
+  `repeatCell`/`updateCells` `textFormat.bold` on the header rows after writing the values.
+- **The Stock Metrics merge shifts column positions — verify no position-based reader depends on the old
+  layout before shipping.** Stock Metrics is clear-and-rewrite (lower risk than the position-load-bearing
+  Transactions tab per #22), but confirm nothing reads Stock Metrics / the removed Price History tab by
+  column index, and update `STOCK_METRICS_HEADERS` + the `As Of Date`-last invariant together.
+
+---
+
 ## Phase Sequence & Dependencies
 
 ```
@@ -1306,6 +1413,7 @@ Phase 18 (Ticker renames, TICKER_RENAMES)          ← fixes rename oversell in 
 Phase 19 (Stock splits/dividends, in-place lots)   ← extends Phase 2 parser + Phase 3 FIFO [built]
 Phase 20 (Cash transfers + cash-model validation)  ← extends Phase 2 parser + Phase 3 cash [built; snapshot reconcile deferred]
 Phase 21 (Stateful ongoing: replay from the sheet)  ← reworks Phase 5 read-back + Phase 6 account_state [planned]
+Phase 22 (Instructions + tab order/merge/hide)      ← usability/presentation layer on Phase 5 tabs [planned]
 Phase 8 (Hardening) is orthogonal — do it before or after 9–11.
 ```
 
