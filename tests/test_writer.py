@@ -34,6 +34,7 @@ from portfolio.sheets.writer import (
     TAB_STOCK_METRICS,
     TAB_RUN_LOG,
     TAB_WATCHLIST,
+    WATCHLIST_HEADERS,
     TAB_PRICE_HISTORY,
     TAB_PERFORMANCE,
     TAB_PERFORMANCE_BY_YEAR,
@@ -438,6 +439,18 @@ def test_load_watchlist_symbols_missing_tab_creates_and_returns_empty():
     sh.add_worksheet.return_value = ws
     assert load_watchlist_symbols(sh) == []
     sh.add_worksheet.assert_called_once()
+
+
+def test_load_watchlist_symbols_heals_headerless_empty_tab():
+    # A pre-existing but completely empty Watchlist (no Symbol header) must get the
+    # header written so the user has a labeled column — without add_worksheet.
+    ws = _tab_mock(TAB_WATCHLIST, [])  # exists, but blank: no header, no rows
+    sh = _sh_with_tabs(ws)
+    assert load_watchlist_symbols(sh) == []
+    sh.add_worksheet.assert_not_called()
+    _, kwargs = ws.update.call_args
+    assert kwargs["range_name"] == "A1"
+    assert kwargs["values"] == [WATCHLIST_HEADERS]
 
 
 # ---------------------------------------------------------------------------
@@ -907,11 +920,25 @@ def test_write_performance_compare_sets_dropdown_validation():
     assert dv["range"]["endColumnIndex"] == 1 + PERFORMANCE_COMPARE_SLOTS
 
 
-def test_write_performance_compare_idempotent_when_present():
+def test_write_performance_compare_heals_grid_preserving_picks_when_present():
+    # A tab left with dropdowns but no label/formula grid must self-heal: rewrite
+    # the deterministic cells WITHOUT recreating the tab, re-applying validation
+    # (would revert manual multi-select), or touching row-1 slot picks (B1..).
     ws = MagicMock()
     ws.title = TAB_PERFORMANCE_COMPARE
     sh = MagicMock()
     sh.worksheets.return_value = [ws]
+    sh.worksheet.return_value = ws
+
     write_performance_compare(sh)
-    sh.add_worksheet.assert_not_called()
-    sh.batch_update.assert_not_called()
+
+    sh.add_worksheet.assert_not_called()   # never recreated
+    sh.batch_update.assert_not_called()    # dropdown validation left intact
+    # Two writes: A1 label only (1x1, spares row-1 picks) + the rest anchored at A2.
+    ranges = {c.kwargs["range_name"] for c in ws.update.call_args_list}
+    assert ranges == {"A1", "A2"}
+    a1 = next(c for c in ws.update.call_args_list if c.kwargs["range_name"] == "A1")
+    assert a1.kwargs["values"] == [["Symbol →"]]  # single cell — B1.. untouched
+    a2 = next(c for c in ws.update.call_args_list if c.kwargs["range_name"] == "A2")
+    labels = [r[0] for r in a2.kwargs["values"]]
+    assert "Lifetime Total XIRR" in labels  # formula grid restored
