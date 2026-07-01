@@ -11,8 +11,9 @@ class Transaction:
     status: str             # always "Settled" (Pending rows are skipped)
     account_number: str
     account_registration: str  # "CMA-Edge" | "Roth IRA-Edge"
-    tx_type: str            # BUY | SELL | INIT_BUY | DIVIDEND | INTEREST |
-                            # CASH_IN | CASH_OUT | ADR_FEE | TAX_WITHHOLDING | REINVEST
+    tx_type: str            # BUY | SELL | INIT_BUY | SPLIT | DIVIDEND | INTEREST |
+                            # CASH_IN | CASH_OUT | CASH_TRANSFER_IN | ADR_FEE |
+                            # TAX_WITHHOLDING | REINVEST | CONTRIBUTION_INFO | UNKNOWN
     description: str
     symbol: str | None      # None for cash transactions
     quantity: float | None  # None for dividends/interest

@@ -36,11 +36,11 @@ def test_deposit_and_withdrawal_deltas():
 
 
 def test_bank_interest_credits_cash():
-    # Sweep Bank Interest follows the same parens convention: a credit ships
-    # negative, so delta = -amount adds to cash. (Pending multi-month validation.)
-    txns = [cash_tx("INTEREST", -3.0)]
+    # Bank Interest breaks the sweep parens convention: real exports ship the
+    # credit POSITIVE (e.g. "2.00"), so it must be ADDED, not subtracted.
+    txns = [cash_tx("INTEREST", 2.0)]
     balances = reconstruct_cash(txns, {"11A-00003": 100.0}, STATE)
-    assert balances["11A-00003"] == 103.0
+    assert balances["11A-00003"] == 102.0
 
 
 def test_equity_rows_do_not_touch_cash():
@@ -69,6 +69,37 @@ def test_pre_cutoff_and_unbootstrapped_rows_excluded():
     balances = reconstruct_cash(txns, {"11A-00003": 0.0}, STATE)
     assert balances["11A-00003"] == 100.0
     assert "99Z-99999" not in balances
+
+
+def test_funds_received_wire_credits_cash():
+    # Phase 20 (sign-fix): a "Funds Received" wire is CASH_TRANSFER_IN and its
+    # Amount ships POSITIVE for an inflow (real: "30,000.00", no parens). It must
+    # ADD to cash — the bug this guards is a $30k wire landing as -$30k.
+    txns = [cash_tx("CASH_TRANSFER_IN", 30000.0)]
+    balances = reconstruct_cash(txns, {"11A-00003": 0.0}, STATE)
+    assert balances["11A-00003"] == 30000.0
+
+
+def test_funds_received_not_subtracted_like_sweep_deposit():
+    # Regression for the observed drift: treating the wire like a parens-signed
+    # sweep Deposit (delta = -amount) would flip +30k to -30k. Guard the sign.
+    txns = [cash_tx("CASH_TRANSFER_IN", 30000.0)]
+    balances = reconstruct_cash(txns, {"11A-00003": 5000.0}, STATE)
+    assert balances["11A-00003"] == 35000.0  # NOT -25000
+
+
+def test_contribution_info_excluded_no_double_count():
+    # Phase 20: a Current Year Contribution is recorded-only; the same $8,000
+    # already arrives as an IIAXX Deposit, so only the deposit moves cash. The
+    # contribution ships positive; the IIAXX sweep deposit ships parenthesized.
+    txns = [
+        cash_tx("CONTRIBUTION_INFO", 8000.0, account="22B-00001",
+                registration="Roth IRA-Edge"),
+        cash_tx("CASH_IN", -8000.0, account="22B-00001",
+                registration="Roth IRA-Edge"),  # the IIAXX deposit (parens)
+    ]
+    balances = reconstruct_cash(txns, {"22B-00001": 0.0}, STATE)
+    assert balances["22B-00001"] == 8000.0  # counted once, not 16000
 
 
 def test_reconcile_drift_none_without_snapshot():

@@ -8,6 +8,19 @@ from portfolio.models import CashBalance, Transaction
 
 _DEFAULT_TOLERANCE = 0.01
 
+# Symbol-less rows that are NOT real cash movements. A Current Year Contribution
+# is booked only for the record — the same dollars already arrive as an IIAXX
+# Deposit, so replaying both double-counts (Phase 20, amending Locked Decision 19
+# to admit explicit external inflows like Funds Received wires).
+_CASH_EXCLUDED_TYPES = {"CONTRIBUTION_INFO"}
+
+# Symbol-less rows whose Amount is signed from the INVESTOR's perspective
+# (positive = money IN), the OPPOSITE of the sweep Deposit/Withdrawal ledger rows
+# (Merrill's parens-for-inflow convention). Real exports store Bank Interest and
+# Funds Received wires as positive credits, so they must be ADDED, not subtracted
+# — otherwise a $30,000 wire lands as −$30,000 (an inflow read as an outflow).
+_CREDIT_CONVENTION_TYPES = {"INTEREST", "CASH_TRANSFER_IN"}
+
 
 def cash_account_for(account_registration: str) -> str:
     """Roth accounts settle cash in IIAXX; everything else uses the ML sweep."""
@@ -34,6 +47,14 @@ def reconstruct_cash(
     Cutoff + un-bootstrapped skipping reuse filter_and_partition, so only
     post-cutoff rows of bootstrapped accounts contribute.
 
+    SIGN CAVEAT: two opposite conventions coexist. Sweep Deposit/Withdrawal rows
+    are parens-for-inflow, so delta = -amount. But Bank Interest (INTEREST) and
+    Funds Received wires (CASH_TRANSFER_IN) store a positive amount FOR an inflow,
+    so they credit +amount instead (_CREDIT_CONVENTION_TYPES). A wire is the sole
+    record of that external cash — no sweep Deposit mirrors it. A "Current Year
+    Contribution" (CONTRIBUTION_INFO) is excluded entirely: the same money already
+    arrives as an IIAXX Deposit, so counting both double-counts.
+
     NOTE: pending empirical validation against a real multi-month set. If sweep
     rows turn out NOT to capture every dividend, switch to the economic model
     (sum trade/dividend/fee amounts; treat sweep Deposit/Withdrawal as internal).
@@ -44,7 +65,13 @@ def reconstruct_cash(
     for tx in kept:
         if tx.symbol is not None:
             continue  # equity/dividend/fee row — already netted into the sweep
-        balances[tx.account_number] = balances.get(tx.account_number, 0.0) - tx.amount
+        if tx.tx_type in _CASH_EXCLUDED_TYPES:
+            continue  # recorded-only row (e.g. Roth contribution double of IIAXX)
+        prior = balances.get(tx.account_number, 0.0)
+        if tx.tx_type in _CREDIT_CONVENTION_TYPES:
+            balances[tx.account_number] = prior + tx.amount  # positive = inflow
+        else:
+            balances[tx.account_number] = prior - tx.amount  # parens = inflow
 
     return {account: round(balance, 2) for account, balance in balances.items()}
 

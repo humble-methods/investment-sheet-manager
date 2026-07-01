@@ -54,11 +54,12 @@ Originally **all** corporate actions were out of scope (manual intervention; fla
 combos as `UNKNOWN`). Two amendments:
 - **Ticker renames are now handled in code** via `config.TICKER_RENAMES` (Phase 18) — a rename
   otherwise oversells (bootstrap lots under the old ticker, SELL under the new). First case `ATGE → CVSA`.
-- **Splits / stock dividends** (share-changing, $0 amount) remain unhandled — the parser tags them
-  `UNKNOWN` and `build_lots` ignores them, so share counts understate post-split. **Planned in Phase 19**
-  (in-place lot scaling; VGT ×8 confirmed against the 06/26/2026 tax-lots file).
-- **Inbound cash transfers / contributions** are likewise dropped, so the Cash tab misses wires.
-  **Planned in Phase 20.** Mergers stay manual.
+- **Splits / stock dividends** (share-changing, $0 amount) are handled in code (Phase 18) via a new
+  `SPLIT` type + in-place lot scaling (`qty ×ratio`, `unit_cost ÷ratio`, basis + acq date unchanged),
+  applied during FIFO replay. VGT ×8 confirmed against the 06/26/2026 tax-lots file. **Built in Phase 19.**
+- **Inbound cash transfers** (`Funds Received` wires → `CASH_IN`) now credit reconstructed cash;
+  **Roth contributions** (`Current Year Contribution` → `CONTRIBUTION_INFO`) are recorded-only and
+  excluded from cash math (the IIAXX deposit already books them). **Built in Phase 20.** Mergers stay manual.
 
 ### Price strategy: current via GOOGLEFINANCE, history via Python (Phase 11, partial reversal)
 The original rule ("all price data via GOOGLEFINANCE; Python never fetches prices") is **partially reversed**: **5-year weekly historical closes are fetched by Python/yfinance** and written to a dedicated `Price History` tab, while the **current price stays a live GOOGLEFINANCE formula** on Holdings and Stock Metrics. Rationale: a date-ranged series is a 2-D spill that can't live one-row-per-symbol, and the user wants the raw closes available as values. The 52-week high/low GOOGLEFINANCE columns are removed in favor of the full history. (Amends the Phase 4/5 notes below.)
@@ -1109,10 +1110,11 @@ python3 -m pytest tests/test_symbol_overrides.py tests/test_fifo.py -q
 
 ---
 
-## Phase 19 — Stock Splits / Stock Dividends (in-place lot scaling) (PLANNED)
-**Goal:** Handle the `$0.00`-amount share-change events the parser currently drops as `UNKNOWN`
+## Phase 19 — Stock Splits / Stock Dividends (in-place lot scaling) (BUILT)
+**Goal:** Handle the `$0.00`-amount share-change events the parser previously dropped as `UNKNOWN`
 (Non-Obvious #26) by **adjusting the original lots in place** — never adding `$0`-cost shares at the
-event date. **Status: not yet built.**
+event date. **Status: built.** New `SPLIT` type + FIFO in-place scaling; `parse_holding_base` cross-check
+logs a warning on divergence. Real-data VGT ×8 confirmed via unit fixture; KLAC ×10 still deferred.
 
 ### Decision (locked with user)
 A split / stock dividend **scales the existing lots**: `quantity × ratio`, `unit_cost ÷ ratio`, with
@@ -1160,10 +1162,12 @@ qty with a `HOLDING`-base cross-check; revisit only if they ever disagree.
 
 ---
 
-## Phase 20 — Cash-Affecting Transfers + Cash-Model Validation (PLANNED)
+## Phase 20 — Cash-Affecting Transfers + Cash-Model Validation (PARTIALLY BUILT)
 **Goal:** Capture external cash inflows correctly and finally **validate `reconstruct_cash` against a
 post-period Holdings snapshot** (the long-standing Phase 3 / Decision 19 double-count hazard).
-**Status: not yet built.**
+**Status: parser + cash logic built** (`Funds Received → CASH_IN`, `Current Year Contribution →
+CONTRIBUTION_INFO` excluded from cash math). The real-data snapshot reconciliation remains **deferred**
+until a post-Jun Holdings CSV is available.
 
 ### Decisions (locked with user — "track inflows, de-dup contributions")
 - **`FundTransfers / Funds Received` → `CASH_IN`.** It is the *only* record of the wire — the $30K wires
@@ -1197,6 +1201,189 @@ python3 -m pytest tests/test_activity_parser.py tests/test_cash.py -q
 
 ---
 
+## Phase 21 — Stateful Ongoing Operation (replay from the sheet, not the run) (PLANNED)
+**Goal:** Make month-to-month operation match the documented model: **bootstrap an account once
+(Unrealized + Holdings), then each subsequent run needs only the new activity CSV(s)** (plus an optional
+current Holdings, used purely for verification/snapshot). **Status: not yet built.**
+
+### The gap (why the current design forces "re-feed everything")
+`compute_holdings`, `reconstruct_cash`, and the performance functions replay `all_transactions` =
+**only the files parsed this run** (`runner.py`). The Transactions sheet is written to and read for
+**write-dedup keys only** (`load_existing_transaction_keys` returns tuples, never rehydrated into
+`Transaction` objects). Two consequences break incremental feeding:
+1. **Bootstrap lots vanish.** A run without the Unrealized file has **no `INIT_BUY` rows** in the replay
+   (they sit in the sheet, un-reloaded), so holdings compute from that month's activity alone →
+   understated positions and latent oversells. Correct results today require re-feeding **Unrealized +
+   every activity file since `init_date`** together.
+2. **Cash double-counts on a current Holdings.** `bootstrap_cash` (the replay's **starting** balance) and
+   `snapshot_cash` (the reconcile target) are the **same object** — the fed Holdings — while the cutoff
+   is frozen at `init_date`. Feed a period-end Holdings and the replay re-adds the whole period's flow on
+   top of a balance that already contains it (Non-Obvious #29 territory: the safe cash model assumes the
+   start is the init-date balance).
+
+### Decisions (to lock with user)
+- **Sheet is the source of truth for replay.** After writing this run's new (deduped) rows, **reload the
+  full Transactions tab into `Transaction` objects** and compute holdings/cash/performance from that set —
+  not from the run's files. Write-then-reload guarantees one source and no double-add of this-run rows.
+- **Freeze bootstrap cash in `account_state.json`.** At bootstrap, persist each account's **init-date cash
+  balance** (per cash account) alongside `init_date`/`bootstrap_source_file`, set once, never overwritten
+  (mirrors the `init_date` rule). `reconstruct_cash` starts from the **persisted** balance.
+- **A fed Holdings becomes snapshot-only.** It no longer seeds the replay; it feeds equity verification +
+  the Cash `snapshot`/`Drift` columns. Drift then reconciles to ≈0 against a **same-dated** snapshot
+  instead of measuring staleness — this also **discharges the deferred Phase 20 real-data validation**.
+- **Onboarding unchanged:** a new account still needs BOTH Unrealized (lots + init_date) and Holdings
+  (now → persisted bootstrap cash). Ongoing = new activity CSV(s) + optional current Holdings.
+
+### Approach
+- New reader `load_all_transactions(sh) -> list[Transaction]` in `sheets/writer.py`, rehydrating by
+  **column position** via `TRANSACTIONS_KEYS` (Non-Obvious #22) — must round-trip dates (ISO→`date`),
+  numbers (fixed-decimal→`float`), blanks→`None`, and every `tx_type` (INIT_BUY, SPLIT,
+  CASH_TRANSFER_IN, CONTRIBUTION_INFO) with correct amount **signs**.
+- Reorder `runner`: parse → write (dedup) → **reload full sheet** → compute from reloaded set.
+- Extend `account_state` schema + bootstrap step to persist `bootstrap_cash` (per cash account); update
+  `save/load_account_state`.
+- `reconstruct_cash`: start balance from persisted `account_state`, not the fed Holdings; `snapshot_cash`
+  = fed Holdings (if any).
+- **Migration:** already-bootstrapped accounts have `init_date` but no `bootstrap_cash`. First run under
+  the new scheme seeds it from the **bootstrap-date** Holdings (`COB == init_date`); if that file isn't
+  present, log + skip cash reconciliation for that account until it is (never guess).
+
+### Deliverables
+- `portfolio/sheets/writer.py` (`load_all_transactions`, position-based rehydration)
+- `portfolio/runner.py` (write-then-reload ordering; bootstrap-cash from state; Holdings → snapshot-only)
+- `portfolio/drive/archiver.py` or account-state module (persist/read `bootstrap_cash`)
+- `portfolio/engine/cash.py` (start from persisted bootstrap; snapshot decoupled)
+- `tests/test_writer.py` (round-trip), `tests/test_runner*.py` / `tests/test_cash.py`
+
+### Validation
+- Unit: `load_all_transactions` round-trips a written sheet to **equal** `Transaction` objects across all
+  types (INIT_BUY/SPLIT/CASH_TRANSFER_IN/None fields), by position not header.
+- Unit: an "ongoing" run fed **only new activity** (bootstrap lots + prior activity from the sheet)
+  reproduces the same holdings as the all-at-once run; a current-dated Holdings does **not** inflate cash
+  (bootstrap frozen in state, snapshot separate); `bootstrap_cash` never overwritten once set.
+- Real data — **two-stage replay of the 01–06/2026 set**: stage 1 bootstrap (Unrealized + Holdings
+  `1/30`); stage 2 feed **only** the two activity files; assert holdings/cash equal the all-in-one run
+  (46,235.92 / 33,238.58 for the wire accounts, etc.). End-to-end Drift≈0 against a period-end Holdings
+  stays **deferred until a post-Jun Holdings CSV exists**.
+```bash
+python3 -m pytest tests/test_writer.py tests/test_cash.py -q
+```
+
+### Risk
+Rehydration fidelity is load-bearing: any type/sign drift on read-back silently corrupts every downstream
+tab. The `test_dedup_readback_is_position_based` guard (Non-Obvious #22) is the anchor; extend it to full
+object round-trip. Reordering the runner also moves holdings/cash/performance **after** the write — verify
+no consumer relied on the pre-write ordering.
+
+---
+
+## Phase 22 — In-Sheet Instructions + Tab Presentation (ordering, merge, hide) (PLANNED)
+**Goal:** Make the sheet self-explanatory and tidy for non-technical family users: a bilingual
+**Instructions** tab (driven by a **codebase source of truth** so it can't silently drift from the code),
+a **fixed, sensible tab order**, the **Stock Metrics + Price History** tabs merged into one, and the
+backing/debug tabs (**Performance By Year**, **Run Log**) **hidden**. **Status: not yet built.**
+
+### Decisions (locked with user)
+- **Canonical tab order, re-applied every run** (tabs currently land in creation order):
+  | # | Tab | Note |
+  |---|-----|------|
+  | 0 | **Instructions** | visible, leftmost |
+  | 1 | Transactions | |
+  | 2 | Holdings | |
+  | 3 | Performance | lifetime; readable, stays visible (also backs Compare) |
+  | 4 | **Stock Metrics** | Price History **merged in** (see below) |
+  | 5 | Performance Compare | |
+  | 6 | Watchlist | editable input |
+  | 7 | Cash | |
+  | — | Performance By Year | **hidden** — backing data for Performance Compare (+ pivot source) |
+  | — | Run Log | **hidden** — debug only |
+- **Merge Price History into Stock Metrics.** Both are one-row-per-symbol over the same symbol universe
+  (recorded ∪ watchlist), clear-and-rewrite. Merged columns:
+  `Symbol | P/E | Div Yield | ROE(1Y…10Y) | Net Income | Book Value | Current Price | Today | 1Y…5Y Ago |
+  As Of Date`. `Current Price` stays a `GOOGLEFINANCE` formula; anniversary prices stay static values
+  (Stock Metrics already mixes formula+value cells). The standalone **Price History tab is removed**; the
+  Drive `price_history_cache.json` (feeds the Performance year math) is **untouched** — this merges only
+  the display tabs.
+- **Performance By Year stays (Performance Compare `INDEX/MATCH`es it) but is HIDDEN.** Long-format backing
+  data; also the right **source for a hand-built per-year pivot** if the user wants one. Never delete while
+  Performance Compare exists.
+- **Run Log → HIDDEN, last, same spreadsheet.** Keep writing it every run (unchanged content); just move
+  it last + hide. (No separate spreadsheet / no external log file.)
+- **One Instructions tab, stacked, Traditional Chinese FIRST, then English**, placed **first / leftmost**.
+- **User supplies the Traditional Chinese.** The codebase source ships **English + `zh` placeholders**;
+  the user fills the `zh` strings. Tests must NOT fail on empty `zh` (warn/allow), only on missing tabs.
+- **Codebase file is the source of truth.** A single reference module holds each tab's purpose/how-to
+  (EN + ZH); `write_instructions` renders it, and a **drift guard** test ties it to the real tab set so a
+  tab added/removed/renamed in code fails CI until the guide is updated (the user's core ask).
+
+### Approach
+- **Merge Price History into Stock Metrics.** Fold `write_price_history`'s anniversary columns into
+  `write_stock_metrics` (one write, one row per symbol), drop the standalone `TAB_PRICE_HISTORY` tab and
+  its writer; keep `histories` fetching + the Drive cache exactly as-is. Update `STOCK_METRICS_HEADERS` and
+  the `As Of Date`-last invariant. (If the old Price History tab exists on a deployed sheet, delete it once
+  on migration.)
+- **New source module** `portfolio/sheets/tab_guide.py`: a `TabDoc` dataclass (`tab` = the real `TAB_*`
+  constant, `kind` = output|input|hidden, `en`, `zh`) and an ordered `TAB_GUIDE: list[TabDoc]` covering
+  every tab in canonical order, plus a short top-of-page "how the workflow works" blurb (drop CSVs → run →
+  read tabs; which two tabs are editable). Emphasize the **editable** surfaces (`Watchlist` = config list
+  of tickers to track even if unheld → flows into Stock Metrics; `Performance Compare` = pick symbols in
+  the row-1 dropdowns).
+- **`write_instructions(sh, guide)`** in `writer.py`: **clear-and-rewrite each run** (it has NO user
+  state and MUST track code — the deliberate OPPOSITE of the set-up-once `Watchlist`/`Performance Compare`
+  tabs, see #23/#30). Render ZH block, a divider, then EN block, as **values**.
+- **`apply_tab_order(sh)`**: one pass after all writes that sets each tab's `index` to the canonical order
+  and `hidden` = True for `Performance By Year` + `Run Log`, via a single `batch_update` of
+  `updateSheetProperties` requests (idempotent; tolerate already-hidden / missing optional tabs).
+- **Drift guard**: derive `WRITTEN_TABS` from a canonical order list (single source for both ordering and
+  the guard); test asserts `{d.tab for d in TAB_GUIDE} == WRITTEN_TABS`. Adding a `write_*` tab without a
+  `TabDoc` (or dropping one) fails the test.
+
+### Deliverables
+- `portfolio/sheets/tab_guide.py` (`TabDoc`, `TAB_GUIDE` — EN authored, ZH placeholders; canonical order)
+- `portfolio/sheets/writer.py` (`write_instructions`, `apply_tab_order`, merged `write_stock_metrics`,
+  remove `write_price_history`/`TAB_PRICE_HISTORY`, `WRITTEN_TABS`)
+- `portfolio/runner.py` (call `write_instructions`; drop the separate price-history write; `apply_tab_order`
+  as the final Sheets step)
+- `tests/test_writer.py` / `tests/test_tab_guide.py`
+- `CLAUDE.md` (tab-structure table: add `Instructions`, merge Price History into Stock Metrics, mark
+  `Performance By Year` + `Run Log` hidden; column-schema update; Non-Obvious for the clear-and-rewrite
+  exception + drift guard)
+
+### Validation
+- Unit: merged `write_stock_metrics` emits the fundamentals **and** anniversary-price columns in one row
+  per symbol, `As Of Date` last, `Current Price` still a `GOOGLEFINANCE` formula.
+- Unit: `write_instructions` renders **ZH before EN**, contains each tab's name + how-to, writes values
+  (not formulas); it is **clear-and-rewrite** (safe to re-run, no user state).
+- Unit: `apply_tab_order` sets the canonical `index` order and hides `Performance By Year` + `Run Log`
+  (idempotent when already ordered/hidden; skips optional tabs absent this run).
+- Unit (**drift guard**): `TAB_GUIDE` covers exactly `WRITTEN_TABS`; an undocumented new tab fails.
+- Unit: empty `zh` placeholders are **allowed** (guide still renders; guard passes).
+- Manual: run against the sheet; confirm order matches the table, Stock Metrics carries price columns,
+  Performance By Year + Run Log hidden but present.
+```bash
+python3 -m pytest tests/test_writer.py tests/test_tab_guide.py -q
+```
+
+### Risk
+`write_instructions` is the one Python tab that MUST clear-and-rewrite (opposite of #23/#30) — guard it so
+nobody "protects" it into a stale no-op. The drift guard only catches tab-set changes, not prose going
+stale within a tab (e.g. a column meaning changes) — content review stays a human step. Hiding
+`Performance By Year`/`Run Log` must never stop them being written (Compare backing data + debug lifeline).
+The Stock Metrics merge shifts column positions — re-check any position-based reader (though Stock Metrics
+is clear-and-rewrite, so lower risk than the Transactions tab).
+
+### Implementation notes (for the session that builds this)
+- **Format the Instructions tab — don't just dump values.** With ZH stacked first, a flat values grid reads
+  cramped. Apply light formatting so it reads like a document: **bold section headers** (a title per tab),
+  a **blank spacer row between tabs**, and a clear ZH/EN divider. Do it via `batch_update`
+  `repeatCell`/`updateCells` `textFormat.bold` on the header rows after writing the values.
+- **The Stock Metrics merge shifts column positions — verify no position-based reader depends on the old
+  layout before shipping.** Stock Metrics is clear-and-rewrite (lower risk than the position-load-bearing
+  Transactions tab per #22), but confirm nothing reads Stock Metrics / the removed Price History tab by
+  column index, and update `STOCK_METRICS_HEADERS` + the `As Of Date`-last invariant together.
+
+---
+
 ## Phase Sequence & Dependencies
 
 ```
@@ -1223,8 +1410,10 @@ Phase 9 (Human headers, dedup-safe reads)
 Cross-cutting (corporate actions + metrics depth; sequence by dependency):
 Phase 17 (ROE by calendar year, 10-yr capacity)   ← supersedes Phase 4 ROE fields [built]
 Phase 18 (Ticker renames, TICKER_RENAMES)          ← fixes rename oversell in Phase 3 FIFO [built]
-Phase 19 (Stock splits/dividends, in-place lots)   ← extends Phase 2 parser + Phase 3 FIFO [planned]
-Phase 20 (Cash transfers + cash-model validation)  ← extends Phase 2 parser + Phase 3 cash [planned]
+Phase 19 (Stock splits/dividends, in-place lots)   ← extends Phase 2 parser + Phase 3 FIFO [built]
+Phase 20 (Cash transfers + cash-model validation)  ← extends Phase 2 parser + Phase 3 cash [built; snapshot reconcile deferred]
+Phase 21 (Stateful ongoing: replay from the sheet)  ← reworks Phase 5 read-back + Phase 6 account_state [planned]
+Phase 22 (Instructions + tab order/merge/hide)      ← usability/presentation layer on Phase 5 tabs [planned]
 Phase 8 (Hardening) is orthogonal — do it before or after 9–11.
 ```
 

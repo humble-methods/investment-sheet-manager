@@ -296,6 +296,14 @@ def load_watchlist_symbols(sh) -> list[str]:
     """
     ws = _ensure_tab(sh, TAB_WATCHLIST, WATCHLIST_HEADERS)
     all_values = ws.get_all_values()
+    # Self-heal: _ensure_tab writes the Symbol header only when it CREATES the tab.
+    # A tab that already exists but is completely empty (created before this code,
+    # or by a partial run) never got a header, leaving the user no labeled column
+    # to fill. Lay it down when the tab is fully blank — never touch existing rows.
+    if not any(cell.strip() for row in all_values for cell in row):
+        ws.update(values=[WATCHLIST_HEADERS], range_name="A1",
+                  value_input_option="USER_ENTERED")
+        return []
     if len(all_values) < 2:
         return []
     header, *data_rows = all_values
@@ -583,24 +591,37 @@ def write_performance_compare(
     slots: int = PERFORMANCE_COMPARE_SLOTS,
     years: int = PERFORMANCE_COMPARE_YEARS,
 ) -> None:
-    """Scaffold the interactive Performance Compare tab (set-up-once).
+    """Scaffold (or self-heal) the interactive Performance Compare tab.
 
     Fixed single-select dropdown slots in row 1 (sourced from the Performance tab's
     symbol column) each drive one side-by-side card of live lookups into the
     Performance / Performance By Year data tabs. Every dynamic value is a formula
-    (years use TODAY()), so the view self-refreshes as those tabs update — we therefore
-    build it only when the tab is absent, never clobbering the user's slot picks.
+    (years use TODAY()), so the view self-refreshes as those tabs update.
+
+    The ONLY user state lives in row 1, cols B.. (the picked symbols). Everything
+    else — the column-A labels and the formula cells — is deterministic. So:
+      - tab absent  → create it, write the full grid, apply dropdowns.
+      - tab present → REWRITE the deterministic label+formula cells (A1 label + rows
+        2+), but never row 1's slot values, so a tab that was left without its grid
+        (e.g. an old scaffold that only got dropdowns) self-heals without clobbering
+        the user's picks. Dropdown validation is left as-is on heal (re-applying
+        would revert any slot the user manually converted to multi-select).
     """
-    if TAB_PERFORMANCE_COMPARE in {ws.title for ws in sh.worksheets()}:
-        return
     grid = _performance_compare_grid(slots, years)
-    ws = sh.add_worksheet(
-        title=TAB_PERFORMANCE_COMPARE,
-        rows=max(len(grid) + 5, 26),
-        cols=max(slots + 1, 26),
-    )
-    ws.update(values=grid, range_name="A1", value_input_option="USER_ENTERED")
-    _apply_compare_dropdowns(sh, ws, slots)
+    if TAB_PERFORMANCE_COMPARE not in {ws.title for ws in sh.worksheets()}:
+        ws = sh.add_worksheet(
+            title=TAB_PERFORMANCE_COMPARE,
+            rows=max(len(grid) + 5, 26),
+            cols=max(slots + 1, 26),
+        )
+        ws.update(values=grid, range_name="A1", value_input_option="USER_ENTERED")
+        _apply_compare_dropdowns(sh, ws, slots)
+        return
+
+    ws = sh.worksheet(TAB_PERFORMANCE_COMPARE)
+    # A1 label only (1x1 — leaves row-1 slots B.. untouched), then rows 2+.
+    ws.update(values=[[grid[0][0]]], range_name="A1", value_input_option="USER_ENTERED")
+    ws.update(values=grid[1:], range_name="A2", value_input_option="USER_ENTERED")
 
 
 def _apply_compare_dropdowns(sh, ws, slots: int) -> None:

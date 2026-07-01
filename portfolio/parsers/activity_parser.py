@@ -26,6 +26,24 @@ TX_TYPE_MAP: dict[tuple[str, str], str] = {
     ("Other", "Withdrawal"): "CASH_OUT",
     ("Other", "Depository Bank (ADR) Fee"): "ADR_FEE",
     ("Other", "Foreign Tax Withholding"): "TAX_WITHHOLDING",
+    # Phase 20: external cash movements. A "Funds Received" wire is the ONLY
+    # record of that cash (no matching sweep Deposit row), so it credits cash. It
+    # gets its OWN type (not CASH_IN) because its Amount is positive-for-inflow —
+    # the opposite of a sweep Deposit's parens convention — and reconstruct_cash
+    # must add it, not subtract it. A "Current Year Contribution" is recorded for
+    # the paper trail only — the same money already lands as an IIAXX Deposit, so
+    # counting it too double-counts; reconstruct_cash excludes CONTRIBUTION_INFO.
+    ("FundTransfers", "Funds Received"): "CASH_TRANSFER_IN",
+    ("FundReceipts", "Current Year Contribution"): "CONTRIBUTION_INFO",
+}
+
+# Combos that can carry a share-changing corporate action (split / stock
+# dividend). They surface as $0-amount rows with a signed share quantity — the
+# "Dividend" combo is otherwise a normal cash dividend, so it is only a SPLIT
+# when it moves shares for no money (see below). Phase 19 / Non-Obvious #26.
+SPLIT_COMBOS: set[tuple[str, str]] = {
+    ("SecurityTransactions", "Stock Dividend Due Bill"),
+    ("SecurityTransactions", "Dividend"),
 }
 
 
@@ -52,13 +70,24 @@ def parse_activity_csv(filepath: str | Path) -> list[Transaction]:
 
             type_key = strip_field(row["Type"])
             desc1_key = strip_field(row["Description 1 "])
-            tx_type = TX_TYPE_MAP.get((type_key, desc1_key))
-            if tx_type is None:
-                logger.warning(
-                    "Unknown (Type, Description 1) combo (%r, %r) in %s",
-                    type_key, desc1_key, filepath.name,
-                )
-                tx_type = "UNKNOWN"
+            combo = (type_key, desc1_key)
+
+            quantity = parse_amount(row["Quantity"])
+            amount = parse_amount(row["Amount ($)"]) or 0.0
+
+            # A split / stock dividend moves shares for no money. Disambiguate it
+            # from a normal cash dividend (nonzero amount, no share quantity) on
+            # amount == 0 and a present share quantity; only then is it a SPLIT.
+            if combo in SPLIT_COMBOS and amount == 0.0 and quantity is not None:
+                tx_type = "SPLIT"
+            else:
+                tx_type = TX_TYPE_MAP.get(combo)
+                if tx_type is None:
+                    logger.warning(
+                        "Unknown (Type, Description 1) combo (%r, %r) in %s",
+                        type_key, desc1_key, filepath.name,
+                    )
+                    tx_type = "UNKNOWN"
 
             transactions.append(Transaction(
                 trade_date=parse_date(row["Trade Date"]),
@@ -69,9 +98,9 @@ def parse_activity_csv(filepath: str | Path) -> list[Transaction]:
                 tx_type=tx_type,
                 description=clean_description(row["Description 2"]),
                 symbol=clean_symbol(row["Symbol/CUSIP #"]),
-                quantity=parse_amount(row["Quantity"]),
+                quantity=quantity,
                 price=parse_amount(row["Price ($)"]),
-                amount=parse_amount(row["Amount ($)"]) or 0.0,
+                amount=amount,
                 source_file=filepath.name,
             ))
 
