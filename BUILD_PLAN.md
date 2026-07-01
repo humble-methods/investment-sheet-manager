@@ -1201,6 +1201,82 @@ python3 -m pytest tests/test_activity_parser.py tests/test_cash.py -q
 
 ---
 
+## Phase 21 — Stateful Ongoing Operation (replay from the sheet, not the run) (PLANNED)
+**Goal:** Make month-to-month operation match the documented model: **bootstrap an account once
+(Unrealized + Holdings), then each subsequent run needs only the new activity CSV(s)** (plus an optional
+current Holdings, used purely for verification/snapshot). **Status: not yet built.**
+
+### The gap (why the current design forces "re-feed everything")
+`compute_holdings`, `reconstruct_cash`, and the performance functions replay `all_transactions` =
+**only the files parsed this run** (`runner.py`). The Transactions sheet is written to and read for
+**write-dedup keys only** (`load_existing_transaction_keys` returns tuples, never rehydrated into
+`Transaction` objects). Two consequences break incremental feeding:
+1. **Bootstrap lots vanish.** A run without the Unrealized file has **no `INIT_BUY` rows** in the replay
+   (they sit in the sheet, un-reloaded), so holdings compute from that month's activity alone →
+   understated positions and latent oversells. Correct results today require re-feeding **Unrealized +
+   every activity file since `init_date`** together.
+2. **Cash double-counts on a current Holdings.** `bootstrap_cash` (the replay's **starting** balance) and
+   `snapshot_cash` (the reconcile target) are the **same object** — the fed Holdings — while the cutoff
+   is frozen at `init_date`. Feed a period-end Holdings and the replay re-adds the whole period's flow on
+   top of a balance that already contains it (Non-Obvious #29 territory: the safe cash model assumes the
+   start is the init-date balance).
+
+### Decisions (to lock with user)
+- **Sheet is the source of truth for replay.** After writing this run's new (deduped) rows, **reload the
+  full Transactions tab into `Transaction` objects** and compute holdings/cash/performance from that set —
+  not from the run's files. Write-then-reload guarantees one source and no double-add of this-run rows.
+- **Freeze bootstrap cash in `account_state.json`.** At bootstrap, persist each account's **init-date cash
+  balance** (per cash account) alongside `init_date`/`bootstrap_source_file`, set once, never overwritten
+  (mirrors the `init_date` rule). `reconstruct_cash` starts from the **persisted** balance.
+- **A fed Holdings becomes snapshot-only.** It no longer seeds the replay; it feeds equity verification +
+  the Cash `snapshot`/`Drift` columns. Drift then reconciles to ≈0 against a **same-dated** snapshot
+  instead of measuring staleness — this also **discharges the deferred Phase 20 real-data validation**.
+- **Onboarding unchanged:** a new account still needs BOTH Unrealized (lots + init_date) and Holdings
+  (now → persisted bootstrap cash). Ongoing = new activity CSV(s) + optional current Holdings.
+
+### Approach
+- New reader `load_all_transactions(sh) -> list[Transaction]` in `sheets/writer.py`, rehydrating by
+  **column position** via `TRANSACTIONS_KEYS` (Non-Obvious #22) — must round-trip dates (ISO→`date`),
+  numbers (fixed-decimal→`float`), blanks→`None`, and every `tx_type` (INIT_BUY, SPLIT,
+  CASH_TRANSFER_IN, CONTRIBUTION_INFO) with correct amount **signs**.
+- Reorder `runner`: parse → write (dedup) → **reload full sheet** → compute from reloaded set.
+- Extend `account_state` schema + bootstrap step to persist `bootstrap_cash` (per cash account); update
+  `save/load_account_state`.
+- `reconstruct_cash`: start balance from persisted `account_state`, not the fed Holdings; `snapshot_cash`
+  = fed Holdings (if any).
+- **Migration:** already-bootstrapped accounts have `init_date` but no `bootstrap_cash`. First run under
+  the new scheme seeds it from the **bootstrap-date** Holdings (`COB == init_date`); if that file isn't
+  present, log + skip cash reconciliation for that account until it is (never guess).
+
+### Deliverables
+- `portfolio/sheets/writer.py` (`load_all_transactions`, position-based rehydration)
+- `portfolio/runner.py` (write-then-reload ordering; bootstrap-cash from state; Holdings → snapshot-only)
+- `portfolio/drive/archiver.py` or account-state module (persist/read `bootstrap_cash`)
+- `portfolio/engine/cash.py` (start from persisted bootstrap; snapshot decoupled)
+- `tests/test_writer.py` (round-trip), `tests/test_runner*.py` / `tests/test_cash.py`
+
+### Validation
+- Unit: `load_all_transactions` round-trips a written sheet to **equal** `Transaction` objects across all
+  types (INIT_BUY/SPLIT/CASH_TRANSFER_IN/None fields), by position not header.
+- Unit: an "ongoing" run fed **only new activity** (bootstrap lots + prior activity from the sheet)
+  reproduces the same holdings as the all-at-once run; a current-dated Holdings does **not** inflate cash
+  (bootstrap frozen in state, snapshot separate); `bootstrap_cash` never overwritten once set.
+- Real data — **two-stage replay of the 01–06/2026 set**: stage 1 bootstrap (Unrealized + Holdings
+  `1/30`); stage 2 feed **only** the two activity files; assert holdings/cash equal the all-in-one run
+  (46,235.92 / 33,238.58 for the wire accounts, etc.). End-to-end Drift≈0 against a period-end Holdings
+  stays **deferred until a post-Jun Holdings CSV exists**.
+```bash
+python3 -m pytest tests/test_writer.py tests/test_cash.py -q
+```
+
+### Risk
+Rehydration fidelity is load-bearing: any type/sign drift on read-back silently corrupts every downstream
+tab. The `test_dedup_readback_is_position_based` guard (Non-Obvious #22) is the anchor; extend it to full
+object round-trip. Reordering the runner also moves holdings/cash/performance **after** the write — verify
+no consumer relied on the pre-write ordering.
+
+---
+
 ## Phase Sequence & Dependencies
 
 ```
@@ -1229,6 +1305,7 @@ Phase 17 (ROE by calendar year, 10-yr capacity)   ← supersedes Phase 4 ROE fie
 Phase 18 (Ticker renames, TICKER_RENAMES)          ← fixes rename oversell in Phase 3 FIFO [built]
 Phase 19 (Stock splits/dividends, in-place lots)   ← extends Phase 2 parser + Phase 3 FIFO [built]
 Phase 20 (Cash transfers + cash-model validation)  ← extends Phase 2 parser + Phase 3 cash [built; snapshot reconcile deferred]
+Phase 21 (Stateful ongoing: replay from the sheet)  ← reworks Phase 5 read-back + Phase 6 account_state [planned]
 Phase 8 (Hardening) is orthogonal — do it before or after 9–11.
 ```
 
